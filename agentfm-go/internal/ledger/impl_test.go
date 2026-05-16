@@ -307,3 +307,75 @@ func TestAppend_TwoPeerGossipDissemination(t *testing.T) {
 		t.Fatalf("received payload != sent\n sent: %+v\n got:  %+v", sent, &got)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// P1-5 acceptance: 2-peer end-to-end ingestion via the inbox.
+//
+// A appends an entry. B's ledger auto-subscribes to the feedback topic
+// at construction; its inbox should pick up A's entry within a few
+// seconds. Unlike the P1-4 raw-wire test, this exercises the full
+// receive pipeline: pubsub → handler → verify → dedup → chain-check →
+// inbox table.
+// -----------------------------------------------------------------------------
+
+func TestTwoPeer_BInboxIngestsAEntry(t *testing.T) {
+	hosts := testutil.NewConnectedMesh(t, 2)
+	hostA, hostB := hosts[0], hosts[1]
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	psA, err := pubsub.NewGossipSub(ctx, hostA, pubsub.WithFloodPublish(true))
+	if err != nil {
+		t.Fatalf("pubsub A: %v", err)
+	}
+	psB, err := pubsub.NewGossipSub(ctx, hostB, pubsub.WithFloodPublish(true))
+	if err != nil {
+		t.Fatalf("pubsub B: %v", err)
+	}
+
+	// B's ledger must be constructed FIRST so its subscription is in
+	// place when A starts publishing. We also need a brief grace for
+	// the GossipSub mesh to settle so A's mesh view includes B.
+	keyB, _ := signingIdentity(t)
+	ledgerB, err := ledger.New(filepath.Join(t.TempDir(), "b.db"), keyB, psB)
+	if err != nil {
+		t.Fatalf("ledger B: %v", err)
+	}
+	t.Cleanup(func() { _ = ledgerB.Close() })
+
+	time.Sleep(800 * time.Millisecond)
+
+	keyA, ridA := signingIdentity(t)
+	ledgerA, err := ledger.New(filepath.Join(t.TempDir(), "a.db"), keyA, psA)
+	if err != nil {
+		t.Fatalf("ledger A: %v", err)
+	}
+	t.Cleanup(func() { _ = ledgerA.Close() })
+
+	sent := freshRating(ridA, "honesty", 0.33)
+	hash, err := ledgerA.Append(ctx, sent)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	// Wait up to 5s for B's auto-subscribe goroutine to drain the
+	// gossip message and write the entry into the inbox. We poll
+	// InboxHas, which is a pure read of B's local SQLite state — no
+	// side-effects, so it cleanly distinguishes "gossip arrived and
+	// ingested" from "we manually retried."
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ok, err := ledgerB.InboxHas(ctx, ridA, hash)
+		if err != nil {
+			t.Fatalf("InboxHas: %v", err)
+		}
+		if ok {
+			return // success
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("B's inbox did not ingest A's entry within 5s; hash=%x", hash)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}

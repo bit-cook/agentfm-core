@@ -54,6 +54,7 @@ type _ledgerContractCheck = interface {
 	Head(ctx context.Context) (*pb.LogHead, error)
 	Prove(ctx context.Context, entryHash [32]byte) (*pb.InclusionProof, error)
 	VerifyEntry(ctx context.Context, entry *pb.SignedEntry, knownHead *pb.LogHead) error
+	InboxHas(ctx context.Context, raterID []byte, entryHash [32]byte) (bool, error)
 	Close() error
 }
 

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"agentfm/internal/ledger/inbox"
 	"agentfm/internal/ledger/merkle"
 	pb "agentfm/internal/ledger/pb"
 	"agentfm/internal/ledger/store"
@@ -42,6 +43,17 @@ type ledgerImpl struct {
 	// local-only mode for tests.
 	ps    *pubsub.PubSub
 	topic *pubsub.Topic
+	sub   *pubsub.Subscription
+
+	// inbox owns accept/orphan/promote for entries gossiped by OTHER
+	// peers. Always non-nil after newImpl returns (the store-backed
+	// implementation has no init that can fail at this point).
+	inbox *inbox.Inbox
+
+	// Subscriber goroutine lifecycle. Only populated when ps != nil.
+	subCtx    context.Context
+	subCancel context.CancelFunc
+	subDone   chan struct{}
 }
 
 // newImpl is the real constructor behind the package-level New.
@@ -73,6 +85,7 @@ func newImpl(path string, key crypto.PrivKey, ps *pubsub.PubSub) (Ledger, error)
 		peerID: pid,
 		tree:   tree,
 		ps:     ps,
+		inbox:  inbox.New(s, pid, 0, VerifyEntry, EntryHash), // 0 → DefaultOrphanCap
 	}
 
 	if ps != nil {
@@ -82,6 +95,21 @@ func newImpl(path string, key crypto.PrivKey, ps *pubsub.PubSub) (Ledger, error)
 			return nil, fmt.Errorf("ledger: join feedback topic: %w", err)
 		}
 		l.topic = topic
+
+		sub, err := topic.Subscribe()
+		if err != nil {
+			_ = topic.Close()
+			_ = s.Close()
+			return nil, fmt.Errorf("ledger: subscribe feedback topic: %w", err)
+		}
+		l.sub = sub
+		l.subCtx, l.subCancel = context.WithCancel(context.Background())
+		l.subDone = make(chan struct{})
+		// Pass sub + subCtx + subDone as args so the goroutine holds
+		// stable references — Close() races to nil the struct fields
+		// during shutdown, and we don't want the goroutine reading
+		// through the struct concurrently.
+		go l.runSubscriber(l.subCtx, sub, l.subDone)
 	}
 
 	// Best-effort: seed lastHead from the on-disk head so Head() returns
@@ -257,23 +285,103 @@ func (l *ledgerImpl) Prove(ctx context.Context, entryHash [32]byte) (*pb.Inclusi
 	return nil, ErrNotImplemented
 }
 
-// VerifyEntry is reserved for P1-5 (subscribe + verify + inbox).
-func (l *ledgerImpl) VerifyEntry(ctx context.Context, entry *pb.SignedEntry, knownHead *pb.LogHead) error {
-	return ErrNotImplemented
+// InboxHas reports whether the inbox already holds (raterID, entryHash)
+// in its accepted set. Returns false if the inbox is not yet wired
+// (defensive — shouldn't happen post-newImpl).
+func (l *ledgerImpl) InboxHas(ctx context.Context, raterID []byte, entryHash [32]byte) (bool, error) {
+	if l.inbox == nil {
+		return false, nil
+	}
+	return l.inbox.HasEntry(ctx, raterID, entryHash)
 }
 
-// Close releases the store and the topic. Idempotent: the underlying
-// store handles repeated Close calls cleanly, and a nil topic is just
-// skipped.
+// VerifyEntry routes an entry through the inbox accept/orphan/promote
+// path. knownHead is reserved for stricter inclusion-proof validation
+// in P2-5; ignored in P1-5.
+//
+// Returns nil whether the entry was accepted, deduped, or queued as an
+// orphan. Returns a typed inbox.Err* for verification failures or
+// programming errors so callers can pin specific behaviour in tests.
+func (l *ledgerImpl) VerifyEntry(ctx context.Context, entry *pb.SignedEntry, knownHead *pb.LogHead) error {
+	_ = knownHead
+	if l.inbox == nil {
+		return ErrNotImplemented
+	}
+	return l.inbox.AcceptOrQueue(ctx, entry)
+}
+
+// runSubscriber drains the GossipSub subscription and forwards each
+// non-self message through the inbox. The goroutine exits when ctx
+// is cancelled (Close) or sub.Next returns an error (topic closed).
+// All inputs are passed by argument rather than read from l.* so
+// Close() can race to clear those fields without a data race here.
+func (l *ledgerImpl) runSubscriber(ctx context.Context, sub *pubsub.Subscription, done chan<- struct{}) {
+	defer close(done)
+	for {
+		msg, err := sub.Next(ctx)
+		if err != nil {
+			// Either we're shutting down (ctx cancelled) or the
+			// subscription closed. Either way, exit.
+			return
+		}
+		// Self-message filter — boss/telemetry uses the same pattern.
+		if msg.ReceivedFrom == l.peerID {
+			continue
+		}
+		var entry pb.SignedEntry
+		if err := proto.Unmarshal(msg.Data, &entry); err != nil {
+			slog.Debug("ledger: gossip unmarshal failed",
+				slog.Any(obs.FieldErr, err),
+				slog.String("topic", network.FeedbackTopic))
+			continue
+		}
+		if err := l.inbox.AcceptOrQueue(ctx, &entry); err != nil {
+			// Silent at info: adversarial inputs are expected. Debug
+			// is appropriate so operators can correlate when needed.
+			slog.Debug("ledger: gossip entry rejected by inbox",
+				slog.Any(obs.FieldErr, err))
+		}
+	}
+}
+
+// Close releases the store, the subscription, and the topic.
+// Idempotent: the underlying store handles repeated Close calls
+// cleanly; nil fields are skipped.
+//
+// Shutdown order matters: cancel the subscriber goroutine first so it
+// stops calling into store / inbox before we close them; then drop
+// the subscription handle; then the topic; then the store.
 func (l *ledgerImpl) Close() error {
+	// Capture and clear lifecycle handles under the lock so that a
+	// second Close call sees nothing to do.
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	subCancel := l.subCancel
+	subDone := l.subDone
+	sub := l.sub
+	topic := l.topic
+	l.subCancel = nil
+	l.subDone = nil
+	l.sub = nil
+	l.topic = nil
+	l.mu.Unlock()
+
+	// Drain subscriber goroutine BEFORE closing the subscription, so
+	// its in-flight Next() exits cleanly via context cancellation.
+	if subCancel != nil {
+		subCancel()
+	}
+	if sub != nil {
+		sub.Cancel()
+	}
+	if subDone != nil {
+		<-subDone
+	}
+
 	var firstErr error
-	if l.topic != nil {
-		if err := l.topic.Close(); err != nil {
+	if topic != nil {
+		if err := topic.Close(); err != nil {
 			firstErr = fmt.Errorf("close topic: %w", err)
 		}
-		l.topic = nil
 	}
 	if err := l.store.Close(); err != nil && firstErr == nil {
 		firstErr = fmt.Errorf("close store: %w", err)

@@ -56,6 +56,12 @@ type Ledger interface {
 	// validation in P2-5). Returns ErrNotImplemented until P1-5.
 	VerifyEntry(ctx context.Context, entry *pb.SignedEntry, knownHead *pb.LogHead) error
 
+	// InboxHas reports whether an entry (raterID, entryHash) has been
+	// ingested into the local inbox from gossip (or via VerifyEntry).
+	// Used by P2-5 inclusion-proof handling and by tests that need to
+	// observe gossip-driven ingestion deterministically.
+	InboxHas(ctx context.Context, raterID []byte, entryHash [32]byte) (bool, error)
+
 	// Close flushes any pending state and releases the underlying
 	// SQLite handle and gossip subscriptions. Safe to call multiple
 	// times; only the first call has effect.
