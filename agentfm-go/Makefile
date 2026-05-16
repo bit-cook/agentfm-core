@@ -46,7 +46,7 @@ DOWNLOAD_URL := https://github.com/$(GITHUB_REPO)/releases/download/$(RELEASE_TA
 RELAY_DOWNLOAD_URL := https://github.com/$(GITHUB_REPO)/releases/download/$(RELEASE_TAG)/$(RELAY_BINARY_NAME)
 
 .PHONY: all check-deps build build-agentfm build-relay build-all install uninstall clean help setup-deps download-install \
-        test test-unit test-integration test-race test-coverage
+        test test-unit test-integration test-race test-coverage proto proto-lint proto-tools
 
 # Default target when someone just types `make`
 all: check-deps build
@@ -197,6 +197,31 @@ clean:
 	@rm -f $(APP_NAME) $(RELAY_NAME)
 	@rm -rf $(BUILD_DIR)
 	@echo "✅ Cleaned."
+
+# ==========================================
+# 🧬 PROTOBUF (v1.3 verifiable agent mesh)
+# ==========================================
+# Generated bindings live under internal/<pkg>/pb/ via go_package + module=agentfm opt.
+# Generated files ARE committed (not regenerated at build time) so contributors don't
+# need buf installed locally for normal development.
+
+BUF := $(shell command -v buf 2>/dev/null || echo "$(shell go env GOPATH)/bin/buf")
+PROTOC_GEN_GO := $(shell command -v protoc-gen-go 2>/dev/null || echo "$(shell go env GOPATH)/bin/protoc-gen-go")
+
+proto-tools:
+	@echo "🧬 Installing proto codegen tools..."
+	@go install github.com/bufbuild/buf/cmd/buf@v1.47.2
+	@go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.0
+	@echo "✅ buf + protoc-gen-go installed under $(shell go env GOPATH)/bin"
+
+proto-lint:
+	@echo "🧬 Linting proto schemas..."
+	@PATH="$(shell go env GOPATH)/bin:$$PATH" $(BUF) lint
+
+proto: proto-lint
+	@echo "🧬 Generating Go bindings from proto/..."
+	@PATH="$(shell go env GOPATH)/bin:$$PATH" $(BUF) generate
+	@echo "✅ Bindings regenerated. Commit any changes under internal/*/pb/."
 
 # ==========================================
 # 🧪 TESTS
