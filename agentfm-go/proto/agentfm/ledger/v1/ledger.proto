@@ -1,0 +1,186 @@
+// AgentFM verifiable agent mesh — ledger wire envelopes.
+//
+// See: docs/superpowers/plans/2026-05-16-verifiable-agent-mesh-implementation.md
+//      docs/superpowers/specs/2026-05-02-verifiable-mesh-design.md
+//
+// Wire-format rules every consumer MUST follow:
+//   1. All hash / signature / peer-id fields are `bytes`, never `string`,
+//      so callers cannot accidentally apply unicode normalisation.
+//   2. Signing is done over SHA-256(canonical_bytes), where canonical_bytes
+//      is the message marshalled with mutable fields (Signature, WitnessSigs,
+//      RekorAnchor) zeroed. See internal/ledger/pb/canonical.go.
+//   3. Field numbers 1-7 are the hot path on every entry; do not reuse a
+//      reserved range without bumping the package version.
+//   4. Receivers MUST reject envelopes where:
+//        - score is outside [-1.0, +1.0]
+//        - tree_size == 0 (a head must always reference at least one entry)
+//        - prev_hash length != 32 (SHA-256 only)
+syntax = "proto3";
+
+package agentfm.ledger.v1;
+
+option go_package = "agentfm/internal/ledger/pb";
+
+// One unit of feedback.
+// Machine-issued (e.g. P3-3 attestation, P3-6 probe grade) or human-issued
+// (e.g. P4-3 signed comment). The rater always commits the entry into its
+// OWN log, never the subject's.
+message Rating {
+  // libp2p peer ID (multihash bytes) of the rater. Signing identity is
+  // derived from this ID's embedded public key.
+  bytes rater_peer_id = 1;
+
+  // libp2p peer ID of the rated peer.
+  bytes subject_peer_id = 2;
+
+  // Free-text dimension; reserved values: "honesty", "latency",
+  // "availability", "quality". Unknown dimensions are accepted but ignored
+  // by P3-7's reputation matcher.
+  string dimension = 3;
+
+  // Score in [-1.0, +1.0]. Receivers MUST reject out-of-range envelopes.
+  double score = 4;
+
+  // Free-text correlation handle: task_id, probe_round_id, attestation_id.
+  // Used by the UI to link a rating back to its evidence.
+  string context = 5;
+
+  // Wall-clock at the moment of issuance, nanoseconds since Unix epoch.
+  int64 timestamp_unix_ns = 6;
+
+  // SHA-256 of the prior entry in the rater's log. Exactly 32 bytes.
+  // For the very first entry in a log, this is 32 zero bytes.
+  bytes prev_hash = 7;
+
+  // Ed25519 signature over SHA-256(canonical_bytes), where canonical_bytes
+  // is this message marshalled with `signature` zeroed.
+  bytes signature = 8;
+
+  reserved 9 to 15;
+}
+
+// Free-text review. The body is content-addressed and stored as a separate
+// blob (P4-1) so the Merkle tree stays cheap; only the CID is hashed.
+message Comment {
+  bytes rater_peer_id = 1;
+  bytes subject_peer_id = 2;
+
+  // Multihash CID of the comment body (sha2-256 of the text bytes).
+  // The body is fetched on demand via /agentfm/comment-fetch/1.0.0.
+  bytes text_cid = 3;
+
+  // ISO 639-1 language tag of the body, e.g. "en", "ja".
+  string language = 4;
+
+  // Optional: hash of the Rating entry this comment elaborates on.
+  // 32 bytes if present; 0 bytes if comment stands alone.
+  bytes attached_rating = 5;
+
+  int64 timestamp_unix_ns = 6;
+
+  // SHA-256 of the prior entry in the rater's log. Exactly 32 bytes.
+  bytes prev_hash = 7;
+
+  // Ed25519 signature over SHA-256(canonical_bytes).
+  bytes signature = 8;
+
+  reserved 9 to 15;
+}
+
+// Witness co-signature on a LogHead. M-of-N collected on each new head;
+// see P2-2 / P2-4.
+message WitnessSig {
+  bytes witness_peer_id = 1;
+
+  // Ed25519 signature over the LogHead bytes with WitnessSigs and
+  // RekorAnchor fields zeroed (so all witnesses sign the same bytes
+  // regardless of arrival order).
+  bytes signature = 2;
+
+  reserved 3 to 15;
+}
+
+// Snapshot of a peer's log at a point in time. Heads are gossiped
+// independently of entries to support catch-up after restart.
+message LogHead {
+  bytes peer_id = 1;
+
+  // Number of entries committed at the time this head was signed. MUST be
+  // monotonically non-decreasing for a given peer_id (P2-2 equivocation
+  // check enforces strict growth via consistency proofs).
+  uint64 tree_size = 2;
+
+  // RFC 6962 Merkle root. Exactly 32 bytes.
+  bytes root_hash = 3;
+
+  int64 timestamp_unix_ns = 4;
+
+  // Peer's own Ed25519 signature over SHA-256(canonical_bytes) with
+  // signature, witness_sigs, and rekor_anchor zeroed.
+  bytes signature = 5;
+
+  // Collected M-of-N witness co-signatures; see P2-4.
+  repeated WitnessSig witness_sigs = 6;
+
+  // Optional Sigstore Rekor entry UUID; populated only when this head was
+  // anchored via --rekor-anchor (P5-3).
+  string rekor_anchor = 7;
+
+  reserved 8 to 15;
+}
+
+// Proof that a specific entry sits at a known position in a peer's log
+// under a specific signed head.
+message InclusionProof {
+  // The entry being proven. Exactly one of `rating` or `comment` is set.
+  oneof entry {
+    Rating rating = 1;
+    Comment comment = 2;
+  }
+
+  // Zero-based index of this entry in the log.
+  uint64 position = 3;
+
+  // RFC 6962 audit path: sibling hashes from the leaf up to the root.
+  repeated bytes audit_path = 4;
+
+  // The signed head this proof is verified against. Verifier MUST
+  // re-derive the root from leaf + audit_path and compare to log_head.root_hash.
+  LogHead log_head = 5;
+
+  reserved 6 to 15;
+}
+
+// Public alert raised when a witness sees two LogHeads at the same or
+// overlapping tree_size that do NOT mutually-extend (i.e. the peer has
+// shown forked histories). Triggers permanent equivocator marker
+// downstream (P2-3 / P3-7). Anyone can verify by checking witness_signature
+// against witness_peer_id's public key.
+message EquivocationAlert {
+  bytes peer_id = 1;
+
+  LogHead head_a = 2;
+  LogHead head_b = 3;
+
+  bytes witness_peer_id = 4;
+
+  // Ed25519 signature over SHA-256(canonical_bytes) of this message with
+  // witness_signature zeroed.
+  bytes witness_signature = 5;
+
+  int64 timestamp_unix_ns = 6;
+
+  reserved 7 to 15;
+}
+
+// Tagged-union wrapper used by the ledger to handle either entry kind
+// through a single Append / Verify path. The inner Rating or Comment
+// carries its own prev_hash + signature; SignedEntry just routes by kind.
+message SignedEntry {
+  oneof body {
+    Rating rating = 1;
+    Comment comment = 2;
+  }
+
+  reserved 3 to 15;
+}
