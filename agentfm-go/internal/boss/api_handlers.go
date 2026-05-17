@@ -1,6 +1,7 @@
 package boss
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,7 +31,7 @@ func (b *Boss) handleGetWorkers(w http.ResponseWriter, r *http.Request) {
 	b.mu.RLock()
 	agents := make([]apiWorker, 0, len(b.activeWorkers))
 	for _, profile := range b.activeWorkers {
-		agents = append(agents, profileToAPIWorker(profile))
+		agents = append(agents, b.profileToAPIWorker(profile))
 	}
 	b.mu.RUnlock()
 
@@ -45,26 +46,65 @@ func (b *Boss) handleGetWorkers(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func profileToAPIWorker(p types.WorkerProfile) apiWorker {
+// computeTrustView derives the visibility trust fields for a peer.
+// Called by both profileToAPIWorker and profileToModelEntry so the
+// logic isn't duplicated across two conversion helpers.
+//
+// Phase 1 logic: equivocator → dispatch blocked; else allowed.
+// Phase 8 will add the reputation-floor check here.
+func (b *Boss) computeTrustView(peerIDStr string) (honesty float64, equivocator bool, dispatchAllowed bool, refuseReason string) {
+	dispatchAllowed = true
+	if b.ledger != nil {
+		pid, err := peer.Decode(peerIDStr)
+		if err == nil {
+			marked, ierr := b.ledger.IsEquivocator(context.Background(), []byte(pid))
+			if ierr == nil && marked {
+				equivocator = true
+				dispatchAllowed = false
+				refuseReason = "peer_is_equivocator"
+			}
+		}
+	}
+	if b.reputationEngine != nil {
+		honesty = b.reputationEngine.Score(peerIDStr)
+	}
+	return
+}
+
+// profileToAPIWorker is the method-on-Boss form of the old standalone
+// profileToAPIWorker function. It now populates the visibility fields
+// (image, capability, honesty, equivocator, dispatch_allowed) by calling
+// computeTrustView.
+func (b *Boss) profileToAPIWorker(p types.WorkerProfile) apiWorker {
 	hardwareStr := fmt.Sprintf("%s (CPU: %d Cores)", p.Model, p.CPUCores)
 	if p.HasGPU {
 		hardwareStr = fmt.Sprintf("%s (GPU VRAM: %.1f/%.1f GB)", p.Model, p.GPUUsedGB, p.GPUTotalGB)
 	}
+	honesty, equivocator, dispatchAllowed, refuseReason := b.computeTrustView(p.PeerID)
 	return apiWorker{
-		PeerID:       p.PeerID,
-		Author:       p.Author,
-		Name:         p.AgentName,
-		Status:       p.Status,
-		Hardware:     hardwareStr,
-		Description:  p.AgentDesc,
-		CPUUsagePct:  p.CPUUsagePct,
-		RAMFreeGB:    p.RAMFreeGB,
-		CurrentTasks: p.CurrentTasks,
-		MaxTasks:     p.MaxTasks,
-		HasGPU:       p.HasGPU,
-		GPUUsedGB:    p.GPUUsedGB,
-		GPUTotalGB:   p.GPUTotalGB,
-		GPUUsagePct:  p.GPUUsagePct,
+		PeerID:               p.PeerID,
+		Author:               p.Author,
+		Name:                 p.AgentName,
+		Status:               p.Status,
+		Hardware:             hardwareStr,
+		Description:          p.AgentDesc,
+		CPUUsagePct:          p.CPUUsagePct,
+		RAMFreeGB:            p.RAMFreeGB,
+		CurrentTasks:         p.CurrentTasks,
+		MaxTasks:             p.MaxTasks,
+		HasGPU:               p.HasGPU,
+		GPUUsedGB:            p.GPUUsedGB,
+		GPUTotalGB:           p.GPUTotalGB,
+		GPUUsagePct:          p.GPUUsagePct,
+		AgentImageRef:        p.AgentImageRef,
+		AgentImageDigest:     p.AgentImageDigest,
+		AgentCapability:      p.AgentCapability,
+		HonestyScore:         honesty,
+		IsEquivocator:        equivocator,
+		DispatchAllowed:      dispatchAllowed,
+		DispatchRefuseReason: refuseReason,
+		Online:               true, // all activeWorkers are live peers
+		LastSeen:             nil,  // populated in Phase 6
 	}
 }
 
