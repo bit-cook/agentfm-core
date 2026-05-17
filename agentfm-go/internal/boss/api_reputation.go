@@ -78,25 +78,40 @@ type proofResponse struct {
 }
 
 // handlePeers is the umbrella handler for /v1/peers/* routes. It
-// branches on the suffix (.../reputation, .../log, .../proof) so we
-// register a single ServeMux entry — saves wrestling with
-// Go-1.22-style path patterns when the existing codebase doesn't use
-// any.
+// branches on the suffix (.../reputation, .../log, .../proof, .../comments,
+// or bare {id}) so we register a single ServeMux entry — saves wrestling with
+// Go-1.22-style path patterns when the existing codebase doesn't use any.
 func (b *Boss) handlePeers(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
 	switch {
-	case strings.HasSuffix(r.URL.Path, "/reputation"):
+	case strings.HasSuffix(path, "/reputation"):
 		b.handleReputation(w, r)
-	case strings.HasSuffix(r.URL.Path, "/log"):
+	case strings.HasSuffix(path, "/log"):
 		b.handleLog(w, r)
-	case strings.HasSuffix(r.URL.Path, "/proof"):
+	case strings.HasSuffix(path, "/proof"):
 		b.handleProof(w, r)
-	case strings.HasSuffix(r.URL.Path, "/comments"):
+	case strings.HasSuffix(path, "/comments"):
 		// P4-3 — pre-registered here so the same router covers
 		// comment submission once the handler lands below.
 		b.handleCommentSubmission(w, r)
+	case isPeerSummaryPath(path):
+		// /v1/peers/{id} with no trailing sub-resource.
+		b.handlePeerGet(w, r)
 	default:
 		writeOpenAIError(w, http.StatusNotFound, errTypeInvalidRequest, "not_found", "unknown peers sub-resource")
 	}
+}
+
+// isPeerSummaryPath returns true when the URL path is exactly
+// /v1/peers/{id} (one path segment after the prefix, no sub-resource).
+func isPeerSummaryPath(urlPath string) bool {
+	const prefix = "/v1/peers/"
+	if !strings.HasPrefix(urlPath, prefix) {
+		return false
+	}
+	rest := urlPath[len(prefix):]
+	// No slash in the remainder means it's a bare peer ID.
+	return rest != "" && !strings.Contains(rest, "/")
 }
 
 // handleReputation services GET /v1/peers/{id}/reputation.
@@ -425,6 +440,118 @@ func bytesEqualPB(a, b []byte) bool {
 // Compile-time unused-import suppression for store package — we'll
 // use it once Ledger interface adds OwnEntryIterator in a follow-up.
 var _ = store.KindRating
+
+// peerSummaryResponse is the JSON body for GET /v1/peers/{id}.
+type peerSummaryResponse struct {
+	PeerID               string      `json:"peer_id"`
+	AgentName            string      `json:"agent_name"`
+	Online               bool        `json:"online"`
+	LastSeen             *time.Time  `json:"last_seen,omitempty"`
+	HonestyScore         float64     `json:"honesty_score"`
+	IsEquivocator        bool        `json:"is_equivocator"`
+	DispatchAllowed      bool        `json:"dispatch_allowed"`
+	DispatchRefuseReason string      `json:"dispatch_refuse_reason,omitempty"`
+	EntriesCount         int         `json:"entries_count"`
+	LastEntryAt          *time.Time  `json:"last_entry_at,omitempty"`
+	AdvertisedImageRef   string      `json:"advertised_image_ref,omitempty"`
+	AdvertisedImageDgst  string      `json:"advertised_image_digest,omitempty"`
+	AdvertisedCapability string      `json:"advertised_capability,omitempty"`
+	RaterSummary         raterSummary `json:"rater_summary"`
+}
+
+type raterSummary struct {
+	VerifiedRatersCount   int `json:"verified_raters_count"`
+	UnverifiedRatersCount int `json:"unverified_raters_count"`
+}
+
+// handlePeerGet services GET /v1/peers/{id}.
+func (b *Boss) handlePeerGet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, errTypeInvalidRequest, "method_not_allowed", "only GET supported")
+		return
+	}
+	if b.readStore == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, errTypeServerError, "ledger_unavailable", "ledger not wired on this boss")
+		return
+	}
+
+	peerIDStr := extractPeerID(r.URL.Path, "")
+	if peerIDStr == "" {
+		writeOpenAIError(w, http.StatusBadRequest, errTypeInvalidRequest, "bad_request", "missing peer_id in path")
+		return
+	}
+	pid, err := peer.Decode(peerIDStr)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, errTypeInvalidRequest, "bad_peer_id", err.Error())
+		return
+	}
+
+	ctx := r.Context()
+
+	// Gather all entries for this peer (no cap — we need the full count).
+	entries, err := GatherPeerEntries(ctx, b.readStore, pid, 0)
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, errTypeServerError, "gather_error", err.Error())
+		return
+	}
+
+	// Compute rater summary: distinct raters, verified vs. unverified.
+	seenRaters := make(map[string]struct{})
+	verifiedCount := 0
+	unverifiedCount := 0
+	var lastEntryAt *time.Time
+	for _, e := range entries {
+		raterStr := e.Rater.String()
+		if _, seen := seenRaters[raterStr]; !seen {
+			seenRaters[raterStr] = struct{}{}
+			var hs float64
+			if b.reputationEngine != nil {
+				hs = b.reputationEngine.Score(raterStr)
+			}
+			if hs >= 0.1 {
+				verifiedCount++
+			} else {
+				unverifiedCount++
+			}
+		}
+		if lastEntryAt == nil || e.ReceivedAt.After(*lastEntryAt) {
+			t := e.ReceivedAt
+			lastEntryAt = &t
+		}
+	}
+
+	honesty, equivocator, dispatchAllowed, refuseReason := b.computeTrustView(peerIDStr)
+
+	resp := peerSummaryResponse{
+		PeerID:               peerIDStr,
+		HonestyScore:         honesty,
+		IsEquivocator:        equivocator,
+		DispatchAllowed:      dispatchAllowed,
+		DispatchRefuseReason: refuseReason,
+		EntriesCount:         len(entries),
+		LastEntryAt:          lastEntryAt,
+		RaterSummary: raterSummary{
+			VerifiedRatersCount:   verifiedCount,
+			UnverifiedRatersCount: unverifiedCount,
+		},
+	}
+
+	// Populate live telemetry fields if the peer is in activeWorkers.
+	b.mu.RLock()
+	if profile, ok := b.activeWorkers[peerIDStr]; ok {
+		resp.Online = true
+		resp.AgentName = profile.AgentName
+		resp.AdvertisedImageRef = profile.AgentImageRef
+		resp.AdvertisedImageDgst = profile.AgentImageDigest
+		resp.AdvertisedCapability = profile.AgentCapability
+		if seen, ok := b.lastSeen[peerIDStr]; ok {
+			resp.LastSeen = &seen
+		}
+	}
+	b.mu.RUnlock()
+
+	writeJSON(w, http.StatusOK, resp)
+}
 
 // handleCommentSubmission is filled in by api_comments.go (P4-3).
 // Declared here so the umbrella router compiles in P4-2 alone — the
