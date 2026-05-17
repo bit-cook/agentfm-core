@@ -115,6 +115,10 @@ func bossOptionsFromFlags(
 		cserver.Start()
 		cleanups = append(cleanups, cserver.Stop)
 
+		// Wire commentsStore so GET /v1/peers/{id}/comments/{cid}
+		// can hydrate comment bodies (sub-task 1.5 / Phase 1).
+		opts.CommentsStore = cstore
+
 		// The boss's POST /v1/peers/{id}/comments handler needs a
 		// reference to the boss, but the boss hasn't been
 		// constructed yet (we're producing its Options). Use a

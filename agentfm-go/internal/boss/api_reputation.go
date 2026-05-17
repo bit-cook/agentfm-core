@@ -91,9 +91,11 @@ func (b *Boss) handlePeers(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(path, "/proof"):
 		b.handleProof(w, r)
 	case strings.HasSuffix(path, "/comments"):
-		// P4-3 — pre-registered here so the same router covers
-		// comment submission once the handler lands below.
+		// P4-3 — POST /v1/peers/{id}/comments submits a comment.
 		b.handleCommentSubmission(w, r)
+	case strings.Contains(path, "/comments/"):
+		// GET /v1/peers/{id}/comments/{cid} hydrates a comment body.
+		b.handleCommentBodyGet(w, r)
 	case isPeerSummaryPath(path):
 		// /v1/peers/{id} with no trailing sub-resource.
 		b.handlePeerGet(w, r)

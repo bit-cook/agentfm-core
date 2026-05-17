@@ -8,14 +8,67 @@ import (
 	"sync"
 	"time"
 
+	"net/http"
+
+	"agentfm/internal/ledger"
+	"agentfm/internal/ledger/comments"
+	"agentfm/internal/ledger/store"
 	"agentfm/internal/metrics"
 	"agentfm/internal/network"
 	"agentfm/internal/obs"
+	"agentfm/internal/reputation"
+	"agentfm/internal/trustedagents"
 	"agentfm/internal/types"
 
 	netcore "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
+
+// AttestationMode controls how the Boss handles L1 image-digest
+// verification on dispatch (P3-3). Three modes:
+//
+//   - AttestOff:    no checking; dispatch every worker that advertises
+//                   the requested model/agent.
+//   - AttestWarn:   look up worker's (image_ref, digest) in the trusted
+//                   registry; log mismatches but still dispatch.
+//   - AttestStrict: refuse dispatch on mismatch or (with
+//                   RejectUnknownImages) on absent registry entries.
+//                   The default in production builds.
+type AttestationMode int
+
+const (
+	AttestOff AttestationMode = iota
+	AttestWarn
+	AttestStrict
+)
+
+// String renders the mode for log messages.
+func (m AttestationMode) String() string {
+	switch m {
+	case AttestOff:
+		return "off"
+	case AttestWarn:
+		return "warn"
+	case AttestStrict:
+		return "strict"
+	default:
+		return "?"
+	}
+}
+
+// ParseAttestationMode parses the --attestation-mode flag value. An
+// unknown string falls back to AttestWarn with a log entry — better
+// than crashing a boss on a typo.
+func ParseAttestationMode(s string) AttestationMode {
+	switch s {
+	case "off":
+		return AttestOff
+	case "strict":
+		return AttestStrict
+	default:
+		return AttestWarn
+	}
+}
 
 // MaxInflightAsyncTasks caps how many async submissions can be in flight
 // simultaneously. Without a cap a flood of /api/execute/async POSTs would
@@ -36,14 +89,111 @@ type Boss struct {
 	// /api/execute/async. Buffered to MaxInflightAsyncTasks; non-blocking
 	// send returns 503 to the client when full.
 	asyncSlots chan struct{}
+
+	// P3-3: L1 verification configuration. Resolved at boss startup
+	// from --attestation-mode + --trusted-agents flags. trusted is
+	// always non-nil (falls back to bundled default if no flag).
+	attestation         AttestationMode
+	rejectUnknownImages bool
+	trusted             *trustedagents.Registry
+
+	// Ledger handle (P1+ wiring). Used by:
+	//  - P3-3 to write L1-mismatch ratings into the ledger
+	//  - P3-3 to consult IsEquivocator on dispatch
+	//  - P4-2 HTTP API to expose reputation / log / proof
+	// nil-safe: dispatch helpers fall back to "no-op" when unset
+	// (e.g. tests that wire a Boss without the ledger).
+	ledger ledger.Ledger
+
+	// commentSubmissionHandler is populated in P4-3 when the
+	// comments package is wired. Until then, the umbrella router
+	// returns 501 from this hook.
+	commentSubmissionHandler http.HandlerFunc
+
+	// reputationEngine, when non-nil, is consulted by
+	// buildReputationView for live EigenTrust scores. Wired by the
+	// bootstrap path; tests can set it directly via the unexported
+	// field for HTTP handler testing.
+	reputationEngine *reputation.Engine
+
+	// readStore is the secondary store handle for fresh-on-read
+	// reputation recomputes (see Options.ReadStore).
+	readStore *store.Store
+
+	// commentsStore is the body store for comment CIDs (P4-1).
+	// Used by GET /v1/peers/{id}/comments/{cid} to hydrate comment bodies.
+	// Nil when the comments subsystem is not wired (e.g. in tests that
+	// don't use comments).
+	commentsStore *comments.Store
+}
+
+// Options configures a new Boss. All fields are optional; New
+// preserves defaults for anything left at zero.
+type Options struct {
+	AttestationMode     AttestationMode
+	RejectUnknownImages bool
+	TrustedAgents       *trustedagents.Registry
+	Ledger              ledger.Ledger
+
+	// CommentSubmissionHandler, when non-nil, replaces the default
+	// 501 stub for POST /v1/peers/{id}/comments (P4-3). Production
+	// wiring builds this via NewCommentSubmissionHandler(store,
+	// host) and passes its HandleHTTP-bound closure here.
+	CommentSubmissionHandler http.HandlerFunc
+
+	// ReputationEngine, when non-nil, is consulted by
+	// /v1/peers/{id}/reputation to source scores. Bootstrap
+	// typically wires this together with a background ticker that
+	// calls engine.Recompute(ctx, store) every 60s.
+	ReputationEngine *reputation.Engine
+
+	// ReadStore is a store handle the boss uses to trigger
+	// fresh-on-read reputation recomputes. Bootstrap opens a
+	// secondary handle on the same SQLite file (WAL mode allows
+	// concurrent handles) and passes it here. Without this, the
+	// engine's score table only refreshes on the 60s ticker —
+	// which is too coarse for demos and feels broken when a
+	// strict-mode dispatch rejection doesn't immediately reflect
+	// in /v1/peers/.../reputation.
+	ReadStore *store.Store
+
+	// CommentsStore, when non-nil, is the body store for comment CIDs.
+	// Used by GET /v1/peers/{id}/comments/{cid} to hydrate comment text.
+	CommentsStore *comments.Store
 }
 
 func New(node *network.MeshNode) *Boss {
+	return NewWithOptions(node, Options{})
+}
+
+// NewWithOptions is the production constructor that wires the L1
+// verification layer + ledger access. Existing call sites that
+// don't care about either continue using New.
+func NewWithOptions(node *network.MeshNode, opts Options) *Boss {
+	trusted := opts.TrustedAgents
+	if trusted == nil {
+		// Fall back to bundled default so a fresh install always has
+		// a working registry. Errors here are non-fatal — the boss
+		// runs with an empty registry (everything is "unknown").
+		if reg, err := trustedagents.LoadDefault(); err == nil {
+			trusted = reg
+		} else {
+			slog.Warn("boss: bundled trusted-agents manifest failed to load; running with empty registry", slog.Any(obs.FieldErr, err))
+		}
+	}
 	return &Boss{
-		node:          node,
-		activeWorkers: make(map[string]types.WorkerProfile),
-		lastSeen:      make(map[string]time.Time),
-		asyncSlots:    make(chan struct{}, MaxInflightAsyncTasks),
+		node:                     node,
+		activeWorkers:            make(map[string]types.WorkerProfile),
+		lastSeen:                 make(map[string]time.Time),
+		asyncSlots:               make(chan struct{}, MaxInflightAsyncTasks),
+		attestation:              opts.AttestationMode,
+		rejectUnknownImages:      opts.RejectUnknownImages,
+		trusted:                  trusted,
+		ledger:                   opts.Ledger,
+		commentSubmissionHandler: opts.CommentSubmissionHandler,
+		reputationEngine:         opts.ReputationEngine,
+		readStore:                opts.ReadStore,
+		commentsStore:            opts.CommentsStore,
 	}
 }
 
