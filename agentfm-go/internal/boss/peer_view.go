@@ -3,6 +3,11 @@
 // sorted newest-first, and capped at limit. Used by both:
 //   - GET /v1/peers/{id}/log (HTTP API, sub-task 1.3)
 //   - GET /v1/peers/{id}     (single-peer summary, sub-task 1.4)
+//
+// Also implements KnownPeer / ListKnownPeers (Phase 6 offline-peer
+// visibility, sub-task 6.2): combines in-memory activeWorkers (online
+// peers from telemetry) with store.DistinctSubjects (peers known only
+// via ledger entries) into one sorted list.
 package boss
 
 import (
@@ -121,4 +126,76 @@ func bytesEqualPB(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+// KnownPeer is the operator-facing view of a peer the boss has heard about,
+// whether currently online (in activeWorkers) or only seen via ledger entries
+// (offline / never-seen-alive).
+type KnownPeer struct {
+	PeerID        peer.ID
+	AgentName     string    // empty for never-seen-alive peers
+	LastSeen      time.Time // zero for never-seen-alive peers
+	IsOnline      bool
+	HonestyScore  float64
+	IsEquivocator bool
+}
+
+// ListKnownPeers returns every peer the boss has heard about, sorted with
+// online peers first (newest-first by LastSeen), then offline by LastSeen
+// desc. Uses activeWorkers for online status and store.DistinctSubjects for
+// the rest. Decorates each entry with honesty score and equivocator flag.
+func (b *Boss) ListKnownPeers(ctx context.Context) ([]KnownPeer, error) {
+	known := map[peer.ID]*KnownPeer{}
+
+	b.mu.RLock()
+	for pidStr, p := range b.activeWorkers {
+		pid, err := peer.Decode(pidStr)
+		if err != nil {
+			continue
+		}
+		ls := b.lastSeen[pidStr]
+		known[pid] = &KnownPeer{
+			PeerID:    pid,
+			AgentName: p.AgentName,
+			LastSeen:  ls,
+			IsOnline:  true,
+		}
+	}
+	b.mu.RUnlock()
+
+	if b.readStore != nil {
+		subjects, err := b.readStore.DistinctSubjects(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, pidBytes := range subjects {
+			pid := peer.ID(pidBytes)
+			if _, ok := known[pid]; ok {
+				continue // already online — don't overwrite
+			}
+			known[pid] = &KnownPeer{PeerID: pid, IsOnline: false}
+		}
+	}
+
+	for _, kp := range known {
+		if b.reputationEngine != nil {
+			kp.HonestyScore = b.reputationEngine.Score(kp.PeerID.String())
+		}
+		if b.ledger != nil {
+			marked, _ := b.ledger.IsEquivocator(ctx, []byte(kp.PeerID))
+			kp.IsEquivocator = marked
+		}
+	}
+
+	out := make([]KnownPeer, 0, len(known))
+	for _, kp := range known {
+		out = append(out, *kp)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].IsOnline != out[j].IsOnline {
+			return out[i].IsOnline
+		}
+		return out[i].LastSeen.After(out[j].LastSeen)
+	})
+	return out, nil
 }

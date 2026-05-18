@@ -5,6 +5,8 @@ import (
 
 	"agentfm/internal/network"
 	"agentfm/internal/types"
+
+	"github.com/libp2p/go-libp2p/core/host"
 )
 
 // NewForTest is a thin alias for New, named explicitly so test packages
@@ -30,4 +32,11 @@ func (b *Boss) SeedWorker(p types.WorkerProfile) {
 // future internal renames stay free.
 func (b *Boss) ServeHTTPExecute(w http.ResponseWriter, r *http.Request) {
 	b.handleExecuteTask(w, r)
+}
+
+// HostForTest returns the boss's underlying libp2p host identity so test
+// helpers can write ledger entries attributed to the boss's own peer ID.
+// Must only be used in test code.
+func (b *Boss) HostForTest() host.Host {
+	return b.node.Host
 }
