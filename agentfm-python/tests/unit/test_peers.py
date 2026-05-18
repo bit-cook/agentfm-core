@@ -7,7 +7,6 @@ from httpx import Response
 
 from agentfm import AgentFMClient, AsyncAgentFMClient
 from agentfm.peers import (
-    AsyncPeersNamespace,
     KnownPeer,
     PeerEntry,
     PeerSummary,
