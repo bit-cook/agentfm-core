@@ -2,7 +2,6 @@ package ledger
 
 import (
 	"context"
-	"time"
 
 	pb "agentfm/internal/ledger/pb"
 	"agentfm/internal/ledger/store"
@@ -10,40 +9,14 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// WitnessSet is the (M of N) witness gather configuration for a
-// ledger. Threshold is the minimum number of witness signatures a
-// head must carry to be considered "valid"; heads with fewer sigs
-// are persisted but flagged advisory by IsHeadValid.
-type WitnessSet struct {
-	// Peers is the list of witness PeerIDs the ledger will call on
-	// each new head. Empty list disables co-sign requests entirely
-	// (heads carry no witness_sigs).
-	Peers []peer.ID
-
-	// Threshold M — the minimum number of co-signatures required
-	// for IsHeadValid to return true. If Threshold > len(Peers) the
-	// configuration is unsatisfiable; the ledger logs a warning and
-	// every head will be flagged advisory.
-	Threshold int
-
-	// GatherTimeout caps the per-head total time spent waiting for
-	// witnesses to respond before publishing. 0 means default 10s.
-	GatherTimeout time.Duration
-}
-
-// Options bundles the optional dependencies for constructing a
-// Ledger. Today every field is optional; tomorrow's P2-2 wiring uses
-// Host + WitnessSet to gather co-signatures on each new head.
+// Options bundles the optional dependencies for constructing a Ledger.
 type Options struct {
-	// Host is the libp2p host used to open WitnessProtocol streams to
-	// the configured witness set. nil disables witness gathering.
+	// Host is the libp2p host used to register the LedgerFetchProtocol
+	// and HeadFetchProtocol stream handlers (P2-5, P5-1). nil disables
+	// both handlers (local-only / test mode).
 	Host host.Host
-
-	// Witnesses configures the M-of-N gather. Empty = disabled.
-	Witnesses WitnessSet
 }
 
 // IsHeadValid reports whether head carries at least threshold
@@ -180,8 +153,8 @@ func New(path string, key crypto.PrivKey, ps *pubsub.PubSub) (Ledger, error) {
 	return newImpl(path, key, ps, Options{})
 }
 
-// NewWithOptions is the extended constructor for callers that want to
-// configure witness gathering. Otherwise identical to New.
+// NewWithOptions is the extended constructor for callers that need to
+// supply a libp2p host for fetch protocol handlers. Otherwise identical to New.
 func NewWithOptions(path string, key crypto.PrivKey, ps *pubsub.PubSub, opts Options) (Ledger, error) {
 	return newImpl(path, key, ps, opts)
 }

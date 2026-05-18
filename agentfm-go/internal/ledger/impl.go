@@ -16,7 +16,6 @@ import (
 	"agentfm/internal/ledger/store"
 	"agentfm/internal/network"
 	"agentfm/internal/obs"
-	"agentfm/internal/witness"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -66,20 +65,6 @@ type ledgerImpl struct {
 	subCancel context.CancelFunc
 	subDone   chan struct{}
 
-	// Witness gather (P2-4). witnessClient is nil when Options.Host
-	// was not supplied. witnesses is the (peers, threshold, timeout)
-	// configuration captured from Options at construction time.
-	witnessClient *witness.Client
-	witnesses     WitnessSet
-
-	// witnessAck tracks, per witness PeerID, the tree size we have
-	// last successfully co-signed with that witness. Used to compute
-	// the consistency proof to ship with the next request (Fix-1
-	// audit finding). Guarded by its own mutex so witness gather
-	// goroutines can update independently of the main ledger lock.
-	witnessAckMu sync.Mutex
-	witnessAck   map[peer.ID]uint64
-
 	// fetchHost tracks the host LedgerFetchProtocol was registered
 	// on (P2-5) so Close can unregister cleanly.
 	fetchHost host.Host
@@ -109,17 +94,14 @@ func newImpl(path string, key crypto.PrivKey, ps *pubsub.PubSub, opts Options) (
 	}
 
 	l := &ledgerImpl{
-		store:      s,
-		key:        key,
-		peerID:     pid,
-		tree:       tree,
-		ps:         ps,
-		inbox:      inbox.New(s, pid, 0, VerifyEntry, EntryHash), // 0 → DefaultOrphanCap
-		witnesses:  opts.Witnesses,
-		witnessAck: make(map[peer.ID]uint64),
+		store:  s,
+		key:    key,
+		peerID: pid,
+		tree:   tree,
+		ps:     ps,
+		inbox:  inbox.New(s, pid, 0, VerifyEntry, EntryHash), // 0 → DefaultOrphanCap
 	}
 	if opts.Host != nil {
-		l.witnessClient = witness.NewClient(opts.Host)
 		// P2-5: serve LedgerFetchProtocol so other peers can pull
 		// our entries for inclusion-proof walks. Registered on the
 		// host directly; no separate lifecycle goroutine needed —
@@ -278,16 +260,9 @@ func (l *ledgerImpl) Append(ctx context.Context, payload *pb.SignedEntry) ([32]b
 	}
 	l.mu.Unlock()
 
-	// Phase 2 (no lock): witness gather. Fix-4 audit finding — the
-	// gather can take up to GatherTimeout (default 10s); holding the
-	// ledger lock through that would block every concurrent Head() /
-	// Prove() call. The gather only touches witnessAckMu and reads
-	// the Merkle tree's leaves slice, both safe outside l.mu.
-	l.attachWitnessSigs(ctx, head)
-
-	// Phase 3 (under lock): persist the now-signature-bearing head
-	// and publish. We re-acquire because lastHead is read by Head()
-	// and we want a clean (old head → new head) transition.
+	// Phase 2 (under lock): persist the head and publish. We re-acquire
+	// because lastHead is read by Head() and we want a clean
+	// (old head → new head) transition.
 	headBlob, err := proto.Marshal(head)
 	if err != nil {
 		return [32]byte{}, fmt.Errorf("marshal head: %w", err)
@@ -312,118 +287,6 @@ func (l *ledgerImpl) Append(ctx context.Context, payload *pb.SignedEntry) ([32]b
 	}
 
 	return h, nil
-}
-
-// attachWitnessSigs calls every configured witness in parallel,
-// collects any successful WitnessSig responses, and appends them to
-// head.WitnessSigs. Capped by Witnesses.GatherTimeout (or 10s).
-//
-// For each witness, computes an RFC 6962 consistency proof from the
-// size we last successfully co-signed with that witness up to the
-// new head's tree_size. First sighting → empty proof, witness
-// accepts on trust-on-first-use. On success → record the new ack.
-// On alert → drop the ack so the next attempt starts fresh.
-//
-// Best-effort: peers that error out, time out, or return alerts are
-// simply omitted from head.WitnessSigs. IsHeadValid downstream
-// decides whether the (possibly partial) sigset meets threshold M.
-//
-// IMPORTANT: this method is invoked from Append AFTER the caller has
-// released l.mu (Fix-4 audit finding). It only touches witnessAckMu
-// and the in-memory `tree` snapshot via tree.ConsistencyProof — both
-// safe to read concurrently with subsequent appends because the
-// tree's leaves slice grows monotonically.
-func (l *ledgerImpl) attachWitnessSigs(ctx context.Context, head *pb.LogHead) {
-	if l.witnessClient == nil || len(l.witnesses.Peers) == 0 {
-		return
-	}
-	timeout := l.witnesses.GatherTimeout
-	if timeout == 0 {
-		timeout = 10 * time.Second
-	}
-	gatherCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	type res struct {
-		witness peer.ID
-		sig     *pb.WitnessSig
-		err     error
-	}
-	resultCh := make(chan res, len(l.witnesses.Peers))
-	for _, wpid := range l.witnesses.Peers {
-		proofBytes := l.proofForWitness(wpid, head.TreeSize)
-		go func(w peer.ID, proof [][]byte) {
-			resp, err := l.witnessClient.CoSign(gatherCtx, w, head, proof)
-			if err != nil {
-				resultCh <- res{witness: w, err: err}
-				return
-			}
-			if s := resp.GetSignature(); s != nil {
-				resultCh <- res{witness: w, sig: s}
-				return
-			}
-			// Alert outcome — the offender of the equivocation is
-			// the head's own peer; if WE are the one being accused
-			// then a witness is going to publish the alert on the
-			// topic anyway. Don't attach the alert here.
-			resultCh <- res{witness: w, err: errors.New("witness returned alert")}
-		}(wpid, proofBytes)
-	}
-
-	for range l.witnesses.Peers {
-		r := <-resultCh
-		if r.err != nil {
-			slog.Debug("ledger: witness gather error",
-				slog.String("witness", r.witness.String()),
-				slog.Any(obs.FieldErr, r.err))
-			continue
-		}
-		head.WitnessSigs = append(head.WitnessSigs, r.sig)
-		l.recordWitnessAck(r.witness, head.TreeSize)
-	}
-}
-
-// proofForWitness returns the consistency proof from the witness's
-// last-acknowledged tree size up to newSize. Returns nil if this is
-// our first attempt with this witness (the witness will accept the
-// new head as trust-on-first-use). Reads the in-memory Merkle tree
-// directly — see attachWitnessSigs note about concurrent safety.
-func (l *ledgerImpl) proofForWitness(witnessID peer.ID, newSize uint64) [][]byte {
-	l.witnessAckMu.Lock()
-	oldSize, ok := l.witnessAck[witnessID]
-	l.witnessAckMu.Unlock()
-	if !ok || oldSize == 0 {
-		return nil
-	}
-	// Same size → empty proof; witness will reject if its stored
-	// state disagrees, which is the right outcome.
-	if oldSize >= newSize {
-		return nil
-	}
-	hashes, err := l.tree.ConsistencyProof(oldSize)
-	if err != nil {
-		// In-memory tree didn't have oldSize available — race or
-		// drift; fall back to empty proof and let the witness retry
-		// on its next ack cycle.
-		slog.Debug("ledger: consistency proof unavailable; sending empty",
-			slog.Any(obs.FieldErr, err))
-		return nil
-	}
-	out := make([][]byte, len(hashes))
-	for i, h := range hashes {
-		buf := make([]byte, 32)
-		copy(buf, h[:])
-		out[i] = buf
-	}
-	return out
-}
-
-func (l *ledgerImpl) recordWitnessAck(witnessID peer.ID, size uint64) {
-	l.witnessAckMu.Lock()
-	defer l.witnessAckMu.Unlock()
-	if cur := l.witnessAck[witnessID]; size > cur {
-		l.witnessAck[witnessID] = size
-	}
 }
 
 // signNewHead builds and signs a LogHead snapshotting the current tree.
