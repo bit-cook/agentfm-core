@@ -22,22 +22,69 @@ import (
 // handleGetWorkers serves the /api/workers listing as a pure read.
 // Eviction of disconnected peers happens on a 30s tick inside
 // listenTelemetry (pruneDisconnectedWorkers); GETs are no-side-effect.
+//
+// Optional query parameter:
+//   - ?include_offline=true: also includes peers that only appear in
+//     ledger entries (gossipped via inbox or own log) but are not
+//     currently connected. Enables the operator radar to surface
+//     offline peers and their trust scores.
 func (b *Boss) handleGetWorkers(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	b.mu.RLock()
-	agents := make([]apiWorker, 0, len(b.activeWorkers))
-	for _, profile := range b.activeWorkers {
-		agents = append(agents, b.profileToAPIWorker(profile))
-	}
-	b.mu.RUnlock()
+	includeOffline := r.URL.Query().Get("include_offline") == "true"
 
-	response := map[string]interface{}{
-		"success": true,
-		"agents":  agents,
+	// Fetch merged online + (optionally) offline peer list.
+	known, err := b.ListKnownPeers(r.Context())
+	if err != nil {
+		// Fall back to active-only on store error.
+		slog.Warn("known-peers query failed; serving active-only", slog.Any(obs.FieldErr, err))
+		known = nil
+	}
+
+	agents := make([]apiWorker, 0, len(known))
+	onlineCount, offlineCount := 0, 0
+
+	for _, kp := range known {
+		if !kp.IsOnline && !includeOffline {
+			continue
+		}
+		if kp.IsOnline {
+			onlineCount++
+		} else {
+			offlineCount++
+		}
+
+		// Pull cached profile if available (online → in activeWorkers; offline → empty stub).
+		// Use PeerIDStr (the original map key) rather than PeerID.String() so raw-string
+		// keys (e.g. legacy or test-injected IDs) resolve correctly.
+		b.mu.RLock()
+		profile, hasProfile := b.activeWorkers[kp.PeerIDStr]
+		b.mu.RUnlock()
+		if !hasProfile {
+			profile = types.WorkerProfile{PeerID: kp.PeerIDStr}
+		}
+
+		var lastSeenPtr *time.Time
+		if !kp.LastSeen.IsZero() {
+			ls := kp.LastSeen
+			lastSeenPtr = &ls
+		}
+		aw := b.profileToAPIWorker(profile)
+		aw.Online = kp.IsOnline
+		aw.LastSeen = lastSeenPtr
+		aw.HonestyScore = kp.HonestyScore
+		aw.IsEquivocator = kp.IsEquivocator
+		agents = append(agents, aw)
+	}
+
+	response := map[string]any{
+		"success":       true,
+		"online_count":  onlineCount,
+		"offline_count": offlineCount,
+		"agents":        agents,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

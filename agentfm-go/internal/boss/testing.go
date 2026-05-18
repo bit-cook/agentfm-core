@@ -40,3 +40,10 @@ func (b *Boss) ServeHTTPExecute(w http.ResponseWriter, r *http.Request) {
 func (b *Boss) HostForTest() host.Host {
 	return b.node.Host
 }
+
+// HandleGetWorkersForTest exposes handleGetWorkers to test packages. Used
+// to exercise the ?include_offline query parameter without starting the full
+// API server (auth, bind, CORS, etc.).
+func (b *Boss) HandleGetWorkersForTest(w http.ResponseWriter, r *http.Request) {
+	b.handleGetWorkers(w, r)
+}

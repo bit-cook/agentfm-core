@@ -133,6 +133,10 @@ func bytesEqualPB(a, b []byte) bool {
 // (offline / never-seen-alive).
 type KnownPeer struct {
 	PeerID        peer.ID
+	// PeerIDStr is the original string key used to look up the worker in
+	// activeWorkers. For properly-encoded peer IDs it equals PeerID.String();
+	// for legacy / test-injected raw-string keys it equals the raw string.
+	PeerIDStr     string
 	AgentName     string    // empty for never-seen-alive peers
 	LastSeen      time.Time // zero for never-seen-alive peers
 	IsOnline      bool
@@ -145,17 +149,22 @@ type KnownPeer struct {
 // desc. Uses activeWorkers for online status and store.DistinctSubjects for
 // the rest. Decorates each entry with honesty score and equivocator flag.
 func (b *Boss) ListKnownPeers(ctx context.Context) ([]KnownPeer, error) {
-	known := map[peer.ID]*KnownPeer{}
+	// Key by raw string (not peer.ID) so reverse lookups into activeWorkers are exact.
+	known := map[string]*KnownPeer{}
 
 	b.mu.RLock()
 	for pidStr, p := range b.activeWorkers {
 		pid, err := peer.Decode(pidStr)
 		if err != nil {
-			continue
+			// Fall back to treating the raw string as the peer.ID bytes.
+			// This preserves backwards compatibility with tests that seed
+			// workers with non-standard ID strings (e.g. "peer1").
+			pid = peer.ID(pidStr)
 		}
 		ls := b.lastSeen[pidStr]
-		known[pid] = &KnownPeer{
+		known[pidStr] = &KnownPeer{
 			PeerID:    pid,
+			PeerIDStr: pidStr,
 			AgentName: p.AgentName,
 			LastSeen:  ls,
 			IsOnline:  true,
@@ -170,16 +179,17 @@ func (b *Boss) ListKnownPeers(ctx context.Context) ([]KnownPeer, error) {
 		}
 		for _, pidBytes := range subjects {
 			pid := peer.ID(pidBytes)
-			if _, ok := known[pid]; ok {
+			pidStr := pid.String()
+			if _, ok := known[pidStr]; ok {
 				continue // already online — don't overwrite
 			}
-			known[pid] = &KnownPeer{PeerID: pid, IsOnline: false}
+			known[pidStr] = &KnownPeer{PeerID: pid, PeerIDStr: pidStr, IsOnline: false}
 		}
 	}
 
 	for _, kp := range known {
 		if b.reputationEngine != nil {
-			kp.HonestyScore = b.reputationEngine.Score(kp.PeerID.String())
+			kp.HonestyScore = b.reputationEngine.Score(kp.PeerIDStr)
 		}
 		if b.ledger != nil {
 			marked, _ := b.ledger.IsEquivocator(ctx, []byte(kp.PeerID))
