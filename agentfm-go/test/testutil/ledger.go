@@ -57,4 +57,31 @@ func AppendOwnRating(t testing.TB, s *store.Store, rater host.Host, subject peer
 	}
 }
 
+// AppendInboxRating inserts a Rating entry into the store's INBOX log
+// (the `inbox_entries` table). This simulates ratings received from another
+// peer over gossip — the same path the boss uses after catching up with a
+// remote rater's chain.
+func AppendInboxRating(t testing.TB, s *store.Store, rater host.Host, subject peer.ID, score float64, context string) {
+	t.Helper()
+	now := time.Now().UnixNano()
+	entry := &pb.SignedEntry{Body: &pb.SignedEntry_Rating{Rating: &pb.Rating{
+		RaterPeerId:     []byte(rater.ID()),
+		SubjectPeerId:   []byte(subject),
+		Dimension:       "honesty",
+		Score:           score,
+		Context:         context,
+		TimestampUnixNs: now,
+		PrevHash:        make([]byte, 32),
+	}}}
+	payload, err := proto.Marshal(entry)
+	if err != nil {
+		t.Fatalf("testutil.AppendInboxRating marshal: %v", err)
+	}
+	var hash [32]byte
+	copy(hash[:], payload)
+	if err := s.InsertInboxEntry(ctx2(), []byte(rater.ID()), hash, [32]byte{}, payload); err != nil {
+		t.Fatalf("testutil.AppendInboxRating InsertInboxEntry: %v", err)
+	}
+}
+
 func ctx2() context.Context { return context.Background() }
