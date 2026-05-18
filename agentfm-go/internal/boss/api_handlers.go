@@ -254,4 +254,12 @@ func (b *Boss) handleExecuteTask(w http.ResponseWriter, r *http.Request) {
 	streamSuccess = true
 	status = metrics.StatusOK
 	pterm.Success.Println("✅ API Task Complete. Text streamed to client.")
+
+	// Best-effort: persist optional feedback comment + rating to the ledger.
+	// The task already succeeded; a feedback-append failure only gets logged.
+	if req.Feedback != "" && b.completionRater != nil {
+		if ferr := b.appendFeedbackComment(r.Context(), peerID, req.TaskID, req.Feedback, req.FeedbackRating); ferr != nil {
+			slog.Warn("feedback persist failed", slog.Any(obs.FieldErr, ferr), slog.String(obs.FieldTaskID, req.TaskID))
+		}
+	}
 }

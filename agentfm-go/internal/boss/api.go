@@ -22,10 +22,18 @@ import (
 // ExecuteRequest is the request body accepted by POST /api/execute. A
 // missing task_id is accepted and filled in by the handler so SDK clients
 // that only care about the streamed response don't have to synthesise one.
+//
+// Feedback and FeedbackRating are optional: when Feedback is non-empty the
+// handler appends a signed Comment to the ledger after the task completes
+// (best-effort — task success is not affected by feedback persistence
+// failures). FeedbackRating, when provided, must be in [-1.0, +1.0] and
+// results in a co-appended Rating with dimension="honesty".
 type ExecuteRequest struct {
-	WorkerID string `json:"worker_id"`
-	Prompt   string `json:"prompt"`
-	TaskID   string `json:"task_id"`
+	WorkerID       string   `json:"worker_id"`
+	Prompt         string   `json:"prompt"`
+	TaskID         string   `json:"task_id"`
+	Feedback       string   `json:"feedback,omitempty"`
+	FeedbackRating *float64 `json:"feedback_rating,omitempty"`
 }
 
 // AsyncExecuteRequest is the request body for POST /api/execute/async.
@@ -57,15 +65,15 @@ type apiWorker struct {
 	GPUUsagePct  float64 `json:"gpu_usage_pct"`
 
 	// Visibility fields (Phase 1 / v1.3.1)
-	AgentImageRef       string     `json:"agent_image_ref,omitempty"`
-	AgentImageDigest    string     `json:"agent_image_digest,omitempty"`
-	AgentCapability     string     `json:"agent_capability,omitempty"`
-	HonestyScore        float64    `json:"honesty_score"`
-	IsEquivocator       bool       `json:"is_equivocator"`
-	DispatchAllowed     bool       `json:"dispatch_allowed"`
-	DispatchRefuseReason string    `json:"dispatch_refuse_reason,omitempty"`
-	Online              bool       `json:"online"`
-	LastSeen            *time.Time `json:"last_seen,omitempty"`
+	AgentImageRef        string     `json:"agent_image_ref,omitempty"`
+	AgentImageDigest     string     `json:"agent_image_digest,omitempty"`
+	AgentCapability      string     `json:"agent_capability,omitempty"`
+	HonestyScore         float64    `json:"honesty_score"`
+	IsEquivocator        bool       `json:"is_equivocator"`
+	DispatchAllowed      bool       `json:"dispatch_allowed"`
+	DispatchRefuseReason string     `json:"dispatch_refuse_reason,omitempty"`
+	Online               bool       `json:"online"`
+	LastSeen             *time.Time `json:"last_seen,omitempty"`
 }
 
 // corsMiddleware wraps standard handlers to easily attach headers
