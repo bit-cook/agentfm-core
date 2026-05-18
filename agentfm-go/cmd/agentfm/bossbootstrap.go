@@ -17,6 +17,8 @@ import (
 	"agentfm/internal/obs"
 	"agentfm/internal/reputation"
 	"agentfm/internal/trustedagents"
+
+	netcore "github.com/libp2p/go-libp2p/core/network"
 )
 
 // bossOptionsFromFlags assembles the v1.3 boss.Options bundle that
@@ -90,6 +92,27 @@ func bossOptionsFromFlags(
 	cleanups = append(cleanups, func() { _ = l.Close() })
 	slog.Info("boss bootstrap: ledger opened",
 		slog.String("path", dbPath))
+
+	// P5-1: on restart, pull any entries the boss missed while offline.
+	// Non-fatal: if catch-up fails the boss continues normally.
+	go func() {
+		const waitBudget = 30 * time.Second
+		deadline := time.Now().Add(waitBudget)
+		for time.Now().Before(deadline) {
+			if node.RelayPeerID != "" &&
+				node.Host.Network().Connectedness(node.RelayPeerID) == netcore.Connected {
+				if err := ledger.CatchUp(context.Background(), l, node.Host, node.RelayPeerID); err != nil {
+					slog.Warn("boss bootstrap: catch-up failed",
+						slog.Any(obs.FieldErr, err))
+				} else {
+					slog.Info("boss bootstrap: catch-up complete")
+				}
+				return
+			}
+			time.Sleep(1 * time.Second)
+		}
+		slog.Warn("boss bootstrap: relay never came online within 30s; no catch-up")
+	}()
 
 	// Hourly aggregate outcome rater (P2 / Task 2.1).
 	// RunTicker must be started after the boss is constructed; the

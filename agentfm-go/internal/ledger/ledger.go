@@ -2,12 +2,76 @@ package ledger
 
 import (
 	"context"
+	"time"
 
 	pb "agentfm/internal/ledger/pb"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
+
+// WitnessSet is the (M of N) witness gather configuration for a
+// ledger. Threshold is the minimum number of witness signatures a
+// head must carry to be considered "valid"; heads with fewer sigs
+// are persisted but flagged advisory by IsHeadValid.
+type WitnessSet struct {
+	// Peers is the list of witness PeerIDs the ledger will call on
+	// each new head. Empty list disables co-sign requests entirely
+	// (heads carry no witness_sigs).
+	Peers []peer.ID
+
+	// Threshold M — the minimum number of co-signatures required
+	// for IsHeadValid to return true. If Threshold > len(Peers) the
+	// configuration is unsatisfiable; the ledger logs a warning and
+	// every head will be flagged advisory.
+	Threshold int
+
+	// GatherTimeout caps the per-head total time spent waiting for
+	// witnesses to respond before publishing. 0 means default 10s.
+	GatherTimeout time.Duration
+}
+
+// Options bundles the optional dependencies for constructing a
+// Ledger. Today every field is optional; tomorrow's P2-2 wiring uses
+// Host + WitnessSet to gather co-signatures on each new head.
+type Options struct {
+	// Host is the libp2p host used to open WitnessProtocol streams to
+	// the configured witness set. nil disables witness gathering.
+	Host host.Host
+
+	// Witnesses configures the M-of-N gather. Empty = disabled.
+	Witnesses WitnessSet
+}
+
+// IsHeadValid reports whether head carries at least threshold
+// witness signatures. Callers that consume reputation (P3-7) should
+// gate on this to ignore "advisory" heads — heads with too few
+// witness sigs to be considered confirmed by the local trust
+// configuration.
+//
+// Threshold 0 always returns true (no quorum required).
+//
+// CAVEAT (Fix-9 audit finding): this function does NOT verify the
+// signatures themselves — it only COUNTS them. A peer with control
+// of its own LogHead bytes can pad WitnessSigs with garbage to
+// clear the threshold. For strict admission control, callers should
+// additionally validate each WitnessSig against the witness's
+// expected PeerID + the canonical LogHead bytes via
+// pb.CanonicalLogHead + crypto.PubKey.Verify. Sig-counting is the
+// fast path for routing decisions where the cost of full Verify per
+// dispatch would be prohibitive; do the full verification on the
+// audit / disputed path.
+func IsHeadValid(head *pb.LogHead, threshold int) bool {
+	if head == nil {
+		return false
+	}
+	if threshold <= 0 {
+		return true
+	}
+	return len(head.WitnessSigs) >= threshold
+}
 
 // Entry is the materialised view of a SignedEntry once it has been
 // written to (or read from) a ledger. Callers receive Entry values from
@@ -62,6 +126,29 @@ type Ledger interface {
 	// observe gossip-driven ingestion deterministically.
 	InboxHas(ctx context.Context, raterID []byte, entryHash [32]byte) (bool, error)
 
+	// IsEquivocator reports whether peerID has been marked as a
+	// permanent equivocator by some witness alert this node has
+	// processed. P3-7 uses this to floor the peer's reputation score
+	// at -1.0 regardless of any positive ratings.
+	IsEquivocator(ctx context.Context, peerID []byte) (bool, error)
+
+	// AcceptEntry decodes payload as a pb.SignedEntry proto and routes
+	// it through the inbox accept/orphan/promote path — equivalent to
+	// VerifyEntry(ctx, entry, nil) but accepts raw proto bytes so
+	// callers that obtained the bytes from a network fetch (e.g.
+	// CatchUp) do not need to unmarshal themselves. Returns the same
+	// typed errors as VerifyEntry.
+	AcceptEntry(ctx context.Context, payload []byte) error
+
+	// LastInboxIdx returns the idx of the last relay entry the boss
+	// has already ingested so CatchUp can start paginating from
+	// lastIdx+1 instead of from 1. Returns 0 on a fresh / empty
+	// inbox (catch-up then starts from 1). The idx space is the
+	// relay's own entries table sequence, not the inbox's internal
+	// ordering — callers MUST treat this as a best-effort hint; the
+	// inbox deduplicates so starting from a lower idx is always safe.
+	LastInboxIdx(ctx context.Context) (uint64, error)
+
 	// Close flushes any pending state and releases the underlying
 	// SQLite handle and gossip subscriptions. Safe to call multiple
 	// times; only the first call has effect.
@@ -84,5 +171,11 @@ type Ledger interface {
 // on-disk store at Open, so a process restart resumes the chain at
 // the correct prev_hash without losing any entries.
 func New(path string, key crypto.PrivKey, ps *pubsub.PubSub) (Ledger, error) {
-	return newImpl(path, key, ps)
+	return newImpl(path, key, ps, Options{})
+}
+
+// NewWithOptions is the extended constructor for callers that want to
+// configure witness gathering. Otherwise identical to New.
+func NewWithOptions(path string, key crypto.PrivKey, ps *pubsub.PubSub, opts Options) (Ledger, error) {
+	return newImpl(path, key, ps, opts)
 }
