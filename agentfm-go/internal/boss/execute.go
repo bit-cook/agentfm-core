@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -225,7 +226,7 @@ func (b *Boss) handleFeedbackLoop(ctx context.Context, target peer.ID, taskID st
 	var parsedRating *float64
 	if ratingStr != "" {
 		v, err := strconv.ParseFloat(ratingStr, 64)
-		if err != nil || v < -1.0 || v > 1.0 {
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < -1.0 || v > 1.0 {
 			pterm.Warning.Println("Invalid rating value — saving comment without a rating.")
 		} else {
 			parsedRating = &v
