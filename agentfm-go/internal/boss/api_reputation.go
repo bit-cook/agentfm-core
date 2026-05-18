@@ -324,7 +324,7 @@ func (b *Boss) handleProof(w http.ResponseWriter, r *http.Request) {
 // Without an engine (e.g. unit-test boss), the response carries
 // only the equivocator floor — the same behaviour as P1-6's CLI
 // when scoring isn't available.
-func buildReputationView(ctx context.Context, l ledger.Ledger, eng *reputation.Engine, subject []byte, subjectStr string) (*reputationResponse, error) {
+func buildReputationView(ctx context.Context, l ledger.Ledger, eng reputationEngineIface, subject []byte, subjectStr string) (*reputationResponse, error) {
 	view := &reputationResponse{
 		PeerID: subjectStr,
 		Scores: make(map[string]float64),

@@ -316,20 +316,11 @@ func (b *Boss) pickWorker(model string) (types.WorkerProfile, error) {
 	}
 	b.mu.RUnlock()
 
-	// P3-3: filter out workers that fail the attestation gate AND
-	// known equivocators BEFORE the load-based matcher sees them.
-	// Rating side-effects (the writeAttestationRating call) only
-	// fire when a worker is REJECTED — successful trust dispatch
-	// is the common case and we don't pollute the ledger with +0
-	// ratings on every request.
 	filtered := make(map[string]types.WorkerProfile, len(candidates))
 	for k, w := range candidates {
-		outcome := b.checkAttestation(context.Background(), w)
-		if !outcome.Allowed {
-			b.writeAttestationRating(context.Background(), w, outcome)
-			continue
+		if b.checkTrust(context.Background(), w).Allowed {
+			filtered[k] = w
 		}
-		filtered[k] = w
 	}
 	return selectWorkerForModel(model, filtered)
 }

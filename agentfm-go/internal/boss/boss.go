@@ -76,6 +76,15 @@ func ParseAttestationMode(s string) AttestationMode {
 // to back-pressure (the client gets 202 immediately).
 const MaxInflightAsyncTasks = 256
 
+// reputationEngineIface is the minimal interface Boss requires from the
+// reputation engine. Using an interface rather than *reputation.Engine
+// allows tests to inject a lightweight mock without the full store
+// dependency that Recompute carries.
+type reputationEngineIface interface {
+	Score(peerID string) float64
+	Recompute(ctx context.Context, s *store.Store) (float64, error)
+}
+
 type Boss struct {
 	node          *network.MeshNode
 	activeWorkers map[string]types.WorkerProfile
@@ -114,7 +123,7 @@ type Boss struct {
 	// buildReputationView for live EigenTrust scores. Wired by the
 	// bootstrap path; tests can set it directly via the unexported
 	// field for HTTP handler testing.
-	reputationEngine *reputation.Engine
+	reputationEngine reputationEngineIface
 
 	// readStore is the secondary store handle for fresh-on-read
 	// reputation recomputes (see Options.ReadStore).
@@ -184,6 +193,11 @@ type Options struct {
 	// and calls go opts.CompletionRater.RunTicker(ctx) to emit ratings
 	// every hour.
 	CompletionRater *CompletionRatingWriter
+
+	// ReputationFloor is the minimum honesty score required for dispatch.
+	// Peers scoring below this floor are refused. Zero means "not configured"
+	// (treated as -1.0 = allow all). Use -0.5 as the production default.
+	ReputationFloor float64
 }
 
 func New(node *network.MeshNode) *Boss {
@@ -205,7 +219,7 @@ func NewWithOptions(node *network.MeshNode, opts Options) *Boss {
 			slog.Warn("boss: bundled trusted-agents manifest failed to load; running with empty registry", slog.Any(obs.FieldErr, err))
 		}
 	}
-	return &Boss{
+	b := &Boss{
 		node:                     node,
 		activeWorkers:            make(map[string]types.WorkerProfile),
 		lastSeen:                 make(map[string]time.Time),
@@ -215,11 +229,18 @@ func NewWithOptions(node *network.MeshNode, opts Options) *Boss {
 		trusted:                  trusted,
 		ledger:                   opts.Ledger,
 		commentSubmissionHandler: opts.CommentSubmissionHandler,
-		reputationEngine:         opts.ReputationEngine,
 		readStore:                opts.ReadStore,
 		commentsStore:            opts.CommentsStore,
 		completionRater:          opts.CompletionRater,
+		reputationFloor:          opts.ReputationFloor,
 	}
+	// Assign via explicit nil-check to avoid the classic Go interface/nil gotcha:
+	// a nil *reputation.Engine stored in a reputationEngineIface is a non-nil
+	// interface value, causing nil-pointer panics inside Score/Recompute.
+	if opts.ReputationEngine != nil {
+		b.reputationEngine = opts.ReputationEngine
+	}
+	return b
 }
 
 func (b *Boss) Run(ctx context.Context) {

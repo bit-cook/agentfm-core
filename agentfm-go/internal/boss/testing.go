@@ -4,7 +4,10 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"sync"
 
+	"agentfm/internal/ledger"
+	"agentfm/internal/ledger/store"
 	"agentfm/internal/network"
 	"agentfm/internal/types"
 
@@ -69,4 +72,60 @@ func (b *Boss) SetPeerViewHookForTest(f func(ctx context.Context, peerIDStr stri
 // assert section headers and row content.
 func (b *Boss) RenderRadarForTest(w io.Writer) {
 	b.renderRadar(context.Background(), w)
+}
+
+// WithReputationFloor configures the boss's reputation floor for test use.
+// Returns b for chaining. Production code sets this via Options.ReputationFloor.
+func (b *Boss) WithReputationFloor(f float64) *Boss {
+	b.reputationFloor = f
+	return b
+}
+
+// SetLedger injects a ledger into the boss. Used by integration tests that
+// build a Boss via NewForTest and then supply a real ledger to exercise the
+// equivocator check and ListKnownPeers paths.
+func (b *Boss) SetLedger(l ledger.Ledger) {
+	b.ledger = l
+}
+
+// mockReputationEngine is a minimal engine for test use. Scores are injected
+// via SetReputationScoreForTest; Score() returns the injected value or 0.
+type mockReputationEngine struct {
+	mu     sync.RWMutex
+	scores map[string]float64
+}
+
+func newMockReputationEngine() *mockReputationEngine {
+	return &mockReputationEngine{scores: make(map[string]float64)}
+}
+
+func (m *mockReputationEngine) Score(peerID string) float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.scores[peerID]
+}
+
+// Recompute satisfies reputationEngineIface. The mock never reads a store.
+func (m *mockReputationEngine) Recompute(_ context.Context, _ *store.Store) (float64, error) {
+	return 0, nil
+}
+
+func (m *mockReputationEngine) set(peerID string, score float64) {
+	m.mu.Lock()
+	m.scores[peerID] = score
+	m.mu.Unlock()
+}
+
+// SetReputationScoreForTest injects a score for a given peer ID into a
+// mock reputation engine attached to the boss. If no mock engine is
+// present yet, one is created and installed. Only for use in tests.
+func (b *Boss) SetReputationScoreForTest(pid string, score float64) {
+	if mock, ok := b.reputationEngine.(*mockReputationEngine); ok {
+		mock.set(pid, score)
+		return
+	}
+	// Install a fresh mock engine and set the score.
+	eng := newMockReputationEngine()
+	eng.set(pid, score)
+	b.reputationEngine = eng
 }
