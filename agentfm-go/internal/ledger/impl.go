@@ -576,30 +576,6 @@ func (l *ledgerImpl) VerifyEntry(ctx context.Context, entry *pb.SignedEntry, kno
 	return l.inbox.AcceptOrQueue(ctx, entry)
 }
 
-// PublishAlert satisfies witness.AlertPublisher. Marshals the alert
-// proto and publishes it on EquivocationTopic. Returns an error so
-// the witness can log if publication fails; the alert is also
-// returned to the offending requester in-band regardless.
-func (l *ledgerImpl) PublishAlert(ctx context.Context, alert *pb.EquivocationAlert) error {
-	if l.equivTopic == nil {
-		// Local-only mode or topic-join failed at startup. The
-		// witness still returned the alert to the requester; we just
-		// can't propagate it mesh-wide. Mark the offender locally
-		// anyway so this node's own routing decisions are correct.
-		return l.acceptLocalAlert(ctx, alert)
-	}
-	bs, err := proto.Marshal(alert)
-	if err != nil {
-		return fmt.Errorf("marshal alert: %w", err)
-	}
-	if err := l.equivTopic.Publish(ctx, bs); err != nil {
-		return fmt.Errorf("publish alert: %w", err)
-	}
-	// Also mark locally now so we don't have to wait for our own
-	// gossiped message to come back via runEquivSubscriber.
-	return l.acceptLocalAlert(ctx, alert)
-}
-
 // acceptLocalAlert verifies an EquivocationAlert end-to-end and, on
 // success, marks the offender as a permanent equivocator. The full
 // validation chain (Fix-2 audit finding):
