@@ -6,7 +6,6 @@ import base64
 import hashlib
 
 import httpx
-import pytest
 
 from agentfm.reputation import (
     CommentReceipt,
