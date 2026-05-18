@@ -291,3 +291,67 @@ func TestGatherPeerEntries_UncappedScan(t *testing.T) {
 
 // Check we can import types without an explicit unused-import error
 var _ = strings.Contains
+
+// ---------------------------------------------------------------------------
+// Phase 7: RenderPeerView tests
+// ---------------------------------------------------------------------------
+
+// TestRenderPeerView_RendersRatingScore verifies that a rating appended via
+// testutil.AppendOwnRating appears in the rendered output with the score value.
+func TestRenderPeerView_RendersRatingScore(t *testing.T) {
+	b, store := newTestBossWithLedger(t)
+	// Wire readStore so GatherPeerEntries finds entries.
+	b.readStore = store
+
+	subj := newPeerIDPV(t)
+	insertOwnRating(t, store, b.node.Host.ID(), subj, -0.3)
+
+	out := b.RenderPeerView(context.Background(), subj.String())
+	if !strings.Contains(out, "-0.30") {
+		t.Errorf("rendered view missing -0.30:\n%s", out)
+	}
+}
+
+// TestRenderPeerView_TagsUnverifiedRaters verifies that a rater whose
+// EigenTrust honesty score is < 0.1 is tagged as [unverified].
+func TestRenderPeerView_TagsUnverifiedRaters(t *testing.T) {
+	b, store := newTestBossWithLedger(t)
+	b.readStore = store
+	// No reputation engine → Score returns 0.0 < 0.1 → unverified.
+
+	subj := newPeerIDPV(t)
+	insertOwnRating(t, store, b.node.Host.ID(), subj, -0.3)
+
+	out := b.RenderPeerView(context.Background(), subj.String())
+	if !strings.Contains(out, "[unverified]") {
+		t.Errorf("rendered view missing [unverified] tag:\n%s", out)
+	}
+}
+
+// TestRenderPeerView_NoEntries verifies the empty-state message is shown when
+// there are no ledger entries for the requested peer.
+func TestRenderPeerView_NoEntries(t *testing.T) {
+	b, store := newTestBossWithLedger(t)
+	b.readStore = store
+
+	subj := newPeerIDPV(t)
+	out := b.RenderPeerView(context.Background(), subj.String())
+	if !strings.Contains(out, "No ledger entries about this peer yet") {
+		t.Errorf("expected empty-state message:\n%s", out)
+	}
+}
+
+// TestRenderPeerView_HeaderContainsPeerID verifies the header line includes
+// the short peer ID.
+func TestRenderPeerView_HeaderContainsPeerID(t *testing.T) {
+	b, store := newTestBossWithLedger(t)
+	b.readStore = store
+
+	subj := newPeerIDPV(t)
+	out := b.RenderPeerView(context.Background(), subj.String())
+	wantFragment := subj.String()[:12]
+	if !strings.Contains(out, wantFragment) {
+		t.Errorf("rendered view missing short peer ID %q:\n%s", wantFragment, out)
+	}
+}
+
