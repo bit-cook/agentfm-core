@@ -210,11 +210,30 @@ func (e *Engine) Recompute(ctx context.Context, s *store.Store) (float64, error)
 			if weight == 0 {
 				continue
 			}
+
+			// Per-rater normalization (Sybil + spam resistance):
+			// Group this rater's edges by subject; compute per-subject
+			// weighted mean. Each (rater, subject) pair contributes ONE
+			// bounded weight regardless of how many edges the rater has
+			// to that subject. This prevents a rater from gaining
+			// disproportionate influence by submitting N edges to the
+			// same subject.
+			type subjectAgg struct{ sumValue, sumAgeW float64 }
+			bySubject := make(map[string]subjectAgg, len(edges))
 			for _, ed := range edges {
 				aw := math.Exp(-math.Ln2 * ed.ageDays / halfLife)
-				w := weight * aw
-				sumWeight[ed.subject] += w
-				sumValue[ed.subject] += w * ed.value
+				agg := bySubject[ed.subject]
+				agg.sumValue += aw * ed.value
+				agg.sumAgeW += aw
+				bySubject[ed.subject] = agg
+			}
+			for subjectID, agg := range bySubject {
+				if agg.sumAgeW == 0 {
+					continue
+				}
+				meanVote := agg.sumValue / agg.sumAgeW
+				sumWeight[subjectID] += weight
+				sumValue[subjectID] += weight * meanVote
 			}
 		}
 		for p := range peers {
