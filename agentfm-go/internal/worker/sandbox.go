@@ -74,21 +74,37 @@ func (w *Worker) executePodman(ctx context.Context, prompt string, outStream, er
 		return absOutputDir
 	}
 
-	podmanArgs := []string{"run", "--rm", "--name", containerName, "--network", "host"}
-	hasGPU, _, _, _ := getGPUStats()
-	if hasGPU {
-		podmanArgs = append(podmanArgs, "--device", "nvidia.com/gpu=all")
+	// Resolve every host-dependent value HERE, then hand a plain data struct
+	// to BuildRunArgs. Keeping the probes (GPU present? .env present?) out of
+	// the arg builder is what makes the builder unit-testable without a
+	// container runtime or a populated filesystem.
+	spec := SandboxSpec{
+		ContainerName: containerName,
+		Image:         w.config.ImageName,
+		Prompt:        prompt,
+		OutputDir:     absOutputDir,
+		ModelName:     w.config.ModelName,
+		Network:       NetworkHost,
 	}
 
-	podmanArgs = append(podmanArgs, "-v", fmt.Sprintf("%s:/tmp/output:z", absOutputDir))
+	if hasGPU, _, _, _ := getGPUStats(); hasGPU {
+		spec.GPUDevice = defaultGPUDevice
+	}
 
 	envPath := filepath.Join(w.config.AgentDir, ".env")
 	if _, err := os.Stat(envPath); err == nil {
-		podmanArgs = append(podmanArgs, "--env-file", envPath)
+		spec.EnvFilePath = envPath
 	}
 
-	podmanArgs = append(podmanArgs, "-e", fmt.Sprintf("AGENTFM_MODEL=%s", w.config.ModelName))
-	podmanArgs = append(podmanArgs, w.config.ImageName, prompt)
+	podmanArgs, err := BuildRunArgs(spec)
+	if err != nil {
+		// Only reachable on a malformed spec (empty image / unknown network
+		// mode), i.e. a misconfigured worker. Surface it on the Boss-facing
+		// stream and bail before spawning anything, matching how the
+		// MkdirAll failure above is reported.
+		fmt.Fprintf(errStream, "❌ Failed to build sandbox arguments: %v\n", err)
+		return absOutputDir
+	}
 
 	// exec.CommandContext wires ctx cancellation to SIGKILL of the process.
 	// When the task ctx is cancelled (shutdown, stream death, or timeout),

@@ -56,6 +56,7 @@ The v1.3 release adds a tamper-evident reputation ledger plus runtime verificati
 - `internal/types/types.go::WorkerProfile` adds `IsWitness`, `AgentImageDigest`, `AgentImageRef`, `AgentCapability` (all `omitempty` for backward compatibility).
 - `internal/boss.New(node)` retained as before; new `NewWithOptions(node, Options{...})` constructor for callers that want to wire the ledger, attestation registry, and comment store.
 - `pb.InclusionProof.Entry` now carries the full `SignedEntry` wrapper instead of an inner-only `oneof{Rating|Comment}` — future SignedEntry-level fields survive proof round-trip without silent verification failures.
+- `internal/worker`: the `podman run` argument vector is now produced by a pure `BuildRunArgs(SandboxSpec)` instead of being assembled inline in `executePodman`. The emitted argv is **identical on the nominal path**, pinned by golden tests across all four GPU × env-file combinations. The error path is strictly tightened: a malformed spec (empty image, unknown network mode) now fails *before* any process is spawned instead of letting `podman` reject it. This is the seam every subsequent sandbox-hardening item depends on — before it, no test could observe the container's isolation posture, so removing a security flag broke nothing.
 
 ### Fixed
 
