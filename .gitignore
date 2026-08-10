@@ -31,7 +31,6 @@ Thumbs.db
 *.swp
 *~
 server.py
-constants.go
 graphify-out
 superpowers
 walkthrough

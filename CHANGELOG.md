@@ -57,6 +57,10 @@ The v1.3 release adds a tamper-evident reputation ledger plus runtime verificati
 - `internal/boss.New(node)` retained as before; new `NewWithOptions(node, Options{...})` constructor for callers that want to wire the ledger, attestation registry, and comment store.
 - `pb.InclusionProof.Entry` now carries the full `SignedEntry` wrapper instead of an inner-only `oneof{Rating|Comment}` — future SignedEntry-level fields survive proof round-trip without silent verification failures.
 
+### Fixed
+
+- `internal/network/constants.go` is under version control again. It had been excluded by a `.gitignore` rule since the initial commit, so `agentfm-go` could not be compiled from a clean clone — which is also why the module had no CI. The 16 affected symbols (5 stream protocol IDs, 3 GossipSub topics, 4 timeouts, `MaxArtifactBytes`, `PublicLighthouse`, `RendezvousString`, `MDNSServiceTag`) were reconstructed from the documentation, each with its source cited inline. See `docs/security/AUDIT-2026-08-10.md` §2.
+
 ### Security
 
 - Strict equivocation-alert validation prevents a rogue witness from forging brands against innocent peers (audit fix).
