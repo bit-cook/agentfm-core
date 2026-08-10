@@ -89,9 +89,17 @@ func RunLocalTest(ctx context.Context, cfg Config, prompt string) error {
 	fmt.Println("--------------------------------------------------")
 
 	// Use os.Stdout for testing locally
-	outputDir := w.executePodman(ctx, prompt, os.Stdout, os.Stderr)
+	outputDir, execErr := w.executePodman(ctx, prompt, os.Stdout, os.Stderr)
 
 	fmt.Println("\n--------------------------------------------------")
+
+	// Surface the failure as a non-zero exit of `agentfm -mode test` rather
+	// than printing a success banner. An operator validating an agent image
+	// locally must not read "execution finished" when podman never ran.
+	if execErr != nil {
+		return fmt.Errorf("local sandbox run: %w", execErr)
+	}
+
 	pterm.Success.Printfln("✅ Sandbox execution finished.\n📂 Artifacts saved to: %s", outputDir)
 
 	return nil

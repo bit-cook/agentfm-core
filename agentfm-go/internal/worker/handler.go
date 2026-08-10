@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -178,8 +179,43 @@ func (w *Worker) handleTaskStream(rootCtx context.Context, s netcore.Stream) {
 	pterm.Info.Printfln("Executing task %s in Podman sandbox...", payload.TaskID)
 
 	streamSink := &cancelOnWriteError{w: s, cancel: cancelTask}
-	outputDir := w.executePodman(taskCtx, payload.Data, streamSink, streamSink)
+	outputDir, execErr := w.executePodman(taskCtx, payload.Data, streamSink, streamSink)
 	defer os.RemoveAll(outputDir)
+
+	if execErr != nil {
+		// The human-readable reason is already on the Boss's stream (both
+		// sinks are this stream). What matters here is the terminal status:
+		// a worker that reports OK for work it never performed is the
+		// "billed non-execution" failure mode, and it is reachable by
+		// accident — podman missing from PATH, container service stopped,
+		// disk full.
+		status = metrics.StatusError
+		if errors.Is(taskCtx.Err(), context.DeadlineExceeded) {
+			// Distinguish "ran out of time" from "broke". This is the first
+			// worker-side emitter of StatusTimeout; until now the label was
+			// pre-warmed but only ever set by the Boss.
+			status = metrics.StatusTimeout
+		}
+		slog.Error("sandbox execution",
+			slog.Any(obs.FieldErr, execErr),
+			slog.String(obs.FieldTaskID, payload.TaskID),
+			slog.String(obs.FieldProtocol, "task"))
+
+		if errors.Is(execErr, ErrSandboxNotRun) {
+			// No container ever started, so no artifact can exist: skip the
+			// collection path entirely. Close gracefully rather than reset so
+			// the Boss reads the failure text instead of a bare stream reset.
+			writeTaskFailed(s, "not_run")
+			reset = false
+			return
+		}
+		// ErrSandboxFailed: the container ran and ended badly, but may have
+		// written partial output. Fall through and return what exists — while
+		// keeping the failure status set above. The failure marker is written
+		// AFTER the artifact markers so it stays genuinely terminal; emitting
+		// it first would let a Boss that treats it as end-of-task drop the
+		// very partial output this branch exists to preserve.
+	}
 
 	if !isDirEmpty(outputDir) {
 		_, _ = s.Write([]byte("\n[AGENTFM: FILES_INCOMING]\n"))
@@ -200,9 +236,38 @@ func (w *Worker) handleTaskStream(rootCtx context.Context, s netcore.Stream) {
 		}
 	} else {
 		_, _ = s.Write([]byte("\n[AGENTFM: NO_FILES]\n"))
-		pterm.Success.Println("No artifacts generated. Task complete.")
+		if execErr == nil {
+			pterm.Success.Println("No artifacts generated. Task complete.")
+		} else {
+			pterm.Warning.Println("No artifacts generated; sandbox terminated abnormally.")
+		}
+	}
+
+	// Terminal failure marker, emitted last so a Boss may treat it as
+	// end-of-task without losing anything written before it.
+	if execErr != nil {
+		writeTaskFailed(s, "abnormal_exit")
 	}
 
 	reset = false
-	status = metrics.StatusOK
+	// Only a clean run is a success. execErr is non-nil here exactly when the
+	// container ran and ended abnormally (the never-ran case returned above),
+	// and the status set in that branch must survive.
+	if execErr == nil {
+		status = metrics.StatusOK
+	}
+}
+
+// writeTaskFailed emits the machine-readable terminal marker for a failed
+// task. Without it the failure reaches the Boss only as human prose, so the
+// Boss records the task as completed and fires a "completed" webhook.
+//
+// Safe to emit without a protocol version bump: every consumer filters on the
+// "[AGENTFM:" prefix rather than an enumerated list (boss/openai.go
+// isSentinelLine, agentfm-python streaming.py _classify, the desktop
+// useDispatch hook), so an older Boss or SDK drops the line instead of
+// surfacing it as task output. Boss-side interpretation is a follow-up — see
+// R2 in docs/security/HARDENING-ROADMAP.md.
+func writeTaskFailed(w io.Writer, reason string) {
+	_, _ = w.Write([]byte("\n[AGENTFM: TASK_FAILED " + reason + "]\n"))
 }

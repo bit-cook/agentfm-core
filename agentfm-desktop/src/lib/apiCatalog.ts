@@ -268,6 +268,8 @@ export const API_CATALOG: EndpointDef[] = [
       { name: '(stream)', type: 'text', description: 'Raw worker stdout, forwarded line by line as the container runs.' },
       { name: '[AGENTFM: FILES_INCOMING]', type: 'marker', description: 'An artifact zip will follow on the artifact protocol.' },
       { name: '[AGENTFM: NO_FILES]', type: 'marker', description: 'The task produced no artifacts.' },
+      { name: '[AGENTFM: TASK_FAILED not_run]', type: 'marker', description: 'No container ever started — the task was not executed. Replaces the two markers above.' },
+      { name: '[AGENTFM: TASK_FAILED abnormal_exit]', type: 'marker', description: 'The container ran and exited non-zero or was killed. Emitted after the artifact marker, since partial output may still have been produced.' },
     ],
     errors: [
       { status: '400', when: 'prompt is missing/empty, task_id is malformed, or the body is not valid JSON.' },

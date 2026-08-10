@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,29 @@ import (
 	"time"
 
 	"github.com/pterm/pterm"
+)
+
+// Sandbox outcome sentinels. The Boss pays for compute, so "the task never
+// executed" and "the task executed and ended badly" must never collapse into
+// the same terminal status: the first means no work was done at all, the
+// second means real work happened and may have produced partial output.
+//
+// Before these existed, every failure path returned only an output directory
+// and the caller reported metrics.StatusOK — a worker whose container runtime
+// was missing or wedged told the Boss "Task complete" for work it had never
+// performed. That is the "billed non-execution" failure mode in the threat
+// model, reachable by operational accident rather than malice.
+var (
+	// ErrSandboxNotRun means no container was ever started: the output
+	// directory could not be created, the argument vector was invalid, or the
+	// podman process failed to spawn. Nothing can have been produced.
+	ErrSandboxNotRun = errors.New("sandbox did not run")
+
+	// ErrSandboxFailed means the container started and terminated
+	// abnormally — a non-zero exit, or a SIGKILL from context cancellation
+	// (shutdown, task timeout, dead Boss stream). Partial artifacts may exist
+	// and are still worth collecting.
+	ErrSandboxFailed = errors.New("sandbox terminated abnormally")
 )
 
 func newSessionID() string {
@@ -49,7 +73,17 @@ func (w *Worker) buildSandboxImage(ctx context.Context) error {
 	return nil
 }
 
-func (w *Worker) executePodman(ctx context.Context, prompt string, outStream, errStream io.Writer) string {
+// executePodman runs one task in an ephemeral container and returns the host
+// directory bind-mounted as the task's output.
+//
+// The returned error is nil only when the container ran to completion with a
+// zero exit status. Callers MUST branch on it: returning the output directory
+// alone cannot distinguish "produced nothing" from "never ran". Use errors.Is
+// against ErrSandboxNotRun / ErrSandboxFailed to tell the two apart.
+//
+// The output directory is returned even on error so the caller can still clean
+// it up.
+func (w *Worker) executePodman(ctx context.Context, prompt string, outStream, errStream io.Writer) (string, error) {
 	sessionID := newSessionID()
 	containerName := fmt.Sprintf("agentfm-sandbox-%s", sessionID)
 	// Cleanup runs on a detached, bounded ctx so a cancelled parent doesn't
@@ -71,7 +105,7 @@ func (w *Worker) executePodman(ctx context.Context, prompt string, outStream, er
 
 	if err := os.MkdirAll(absOutputDir, 0755); err != nil {
 		fmt.Fprintf(errStream, "❌ Failed to create output dir: %v\n", err)
-		return absOutputDir
+		return absOutputDir, fmt.Errorf("%w: create output dir: %w", ErrSandboxNotRun, err)
 	}
 
 	// Resolve every host-dependent value HERE, then hand a plain data struct
@@ -103,7 +137,7 @@ func (w *Worker) executePodman(ctx context.Context, prompt string, outStream, er
 		// stream and bail before spawning anything, matching how the
 		// MkdirAll failure above is reported.
 		fmt.Fprintf(errStream, "❌ Failed to build sandbox arguments: %v\n", err)
-		return absOutputDir
+		return absOutputDir, fmt.Errorf("%w: build run args: %w", ErrSandboxNotRun, err)
 	}
 
 	// exec.CommandContext wires ctx cancellation to SIGKILL of the process.
@@ -115,14 +149,19 @@ func (w *Worker) executePodman(ctx context.Context, prompt string, outStream, er
 	cmd.Stderr = errStream
 
 	if err := cmd.Start(); err != nil {
+		// podman absent from PATH, not executable, container service down.
+		// No container exists, so nothing was computed.
 		fmt.Fprintf(errStream, "❌ Failed to start task: %v\n", err)
-		return absOutputDir
+		return absOutputDir, fmt.Errorf("%w: start podman: %w", ErrSandboxNotRun, err)
 	}
 	if err := cmd.Wait(); err != nil {
 		// Non-zero exits and ctx-triggered kills both land here. We surface
-		// the error to the caller's stream so the Boss sees it.
+		// the error to the caller's stream so the Boss sees it, and report it
+		// as a failure so the task is not recorded as a success. The container
+		// did run, so the caller still collects whatever it managed to write.
 		fmt.Fprintf(errStream, "⚠️  Sandbox exited: %v\n", err)
+		return absOutputDir, fmt.Errorf("%w: %w", ErrSandboxFailed, err)
 	}
 
-	return absOutputDir
+	return absOutputDir, nil
 }

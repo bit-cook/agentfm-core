@@ -161,7 +161,16 @@ curl -N http://127.0.0.1:8080/api/execute \
 [AGENTFM: NO_FILES]
 ```
 
-The body is raw worker stdout, forwarded line by line. Two sentinel markers terminate it: `[AGENTFM: FILES_INCOMING]` (an artifact zip lands separately under `./agentfm_artifacts/<task_id>.zip`) or `[AGENTFM: NO_FILES]`.
+The body is raw worker stdout, forwarded line by line. Sentinel markers terminate it:
+
+| Marker | Meaning |
+|---|---|
+| `[AGENTFM: FILES_INCOMING]` | An artifact zip lands separately under `./agentfm_artifacts/<task_id>.zip`. |
+| `[AGENTFM: NO_FILES]` | The task ran and produced no artifacts. |
+| `[AGENTFM: TASK_FAILED not_run]` | No container ever started (runtime missing, invalid sandbox spec). Emitted *instead of* the two markers above — nothing was executed. |
+| `[AGENTFM: TASK_FAILED abnormal_exit]` | The container ran and exited non-zero or was killed. Emitted **after** `FILES_INCOMING` / `NO_FILES`, since a failed run may still have written partial output worth collecting. |
+
+Consumers must filter on the `[AGENTFM:` prefix rather than an enumerated list, so that new markers are dropped rather than surfaced as task output.
 
 **Errors** (plain text unless noted):
 

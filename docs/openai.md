@@ -41,7 +41,7 @@ Within a tier with multiple matches, the least-loaded worker wins. All-busy retu
 
 ## Streaming
 
-Set `stream: true` on `/v1/chat/completions` or `/v1/completions` for SSE deltas. The stream terminates with `data: [DONE]\n\n`. Internal frame markers (`[AGENTFM: FILES_INCOMING]`, `[AGENTFM: NO_FILES]`) are stripped before SSE delivery.
+Set `stream: true` on `/v1/chat/completions` or `/v1/completions` for SSE deltas. The stream terminates with `data: [DONE]\n\n`. Internal frame markers (`[AGENTFM: FILES_INCOMING]`, `[AGENTFM: NO_FILES]`, `[AGENTFM: TASK_FAILED …]`) are stripped before SSE delivery — stripping matches the `[AGENTFM:` prefix, so markers added later never leak into deltas.
 
 Streaming is **line-buffered**, not character-by-character. The 8 MiB max-line cap accommodates structured-output agents that emit large JSON state without newlines.
 
