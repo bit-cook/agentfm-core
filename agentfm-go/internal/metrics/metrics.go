@@ -33,6 +33,11 @@ const (
 	StatusError    = "error"
 	StatusRejected = "rejected"
 	StatusTimeout  = "timeout"
+	// StatusOOMKilled is a task killed for exceeding its memory ceiling
+	// (roadmap R1). Kept distinct from StatusError so an operator can tell a
+	// limit that is set too low from an agent that genuinely crashes — the two
+	// call for opposite responses.
+	StatusOOMKilled = "oom_killed"
 )
 
 // Protocol label values for StreamErrorsTotal.
@@ -174,7 +179,7 @@ func init() {
 	// metric families appear in scrape output even before the first event.
 	// Without this, dashboards alert on "no data" when a fresh node starts
 	// up rather than on actual zero traffic.
-	for _, status := range []string{StatusOK, StatusError, StatusRejected, StatusTimeout} {
+	for _, status := range []string{StatusOK, StatusError, StatusRejected, StatusTimeout, StatusOOMKilled} {
 		TasksTotal.WithLabelValues(status)
 	}
 	for _, proto := range []string{ProtocolTask, ProtocolArtifacts, ProtocolFeedback} {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,6 +149,77 @@ func TestExecutePodman_FailedOnContextCancel(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("cancelling the context did not kill the container: executePodman never returned")
+	}
+}
+
+// A container killed by its memory cgroup exits 137. When a memory ceiling is
+// configured, that is attributable and must be reported as such: an operator
+// looking at a wall of StatusError cannot tell "my limit is too low" from
+// "this agent crashes", and the two call for opposite fixes.
+func TestExecutePodman_AttributesOOMKillToTheMemoryLimit(t *testing.T) {
+	testutil.RequirePOSIX(t)
+
+	w := newSandboxTestWorker(t, "agentfm-test:v1")
+	w.config.Limits = ResourceLimits{MemoryBytes: 64 << 20}
+	testutil.InstallFakePodman(t, "#!/bin/sh\nif [ \"$1\" = \"run\" ]; then exit 137; fi\nexit 0\n")
+
+	_, err := w.executePodman(context.Background(), "prompt", os.Stdout, os.Stderr)
+
+	if !errors.Is(err, ErrSandboxOOMKilled) {
+		t.Fatalf("got error %v, want ErrSandboxOOMKilled", err)
+	}
+	// The refinement must not break callers that only ask "did it run".
+	if !errors.Is(err, ErrSandboxFailed) {
+		t.Error("an OOM kill must still satisfy errors.Is(err, ErrSandboxFailed): the container did run")
+	}
+	if errors.Is(err, ErrSandboxNotRun) {
+		t.Error("an OOM-killed container did run; it must not be reported as ErrSandboxNotRun")
+	}
+}
+
+// Without a configured ceiling, a 137 came from somewhere else — an external
+// kill, the host OOM killer, the agent killing itself. Blaming our memory
+// limit would be a fabricated diagnosis that sends the operator tuning a
+// setting that is not even in effect.
+func TestExecutePodman_DoesNotClaimOOMWithoutAMemoryLimit(t *testing.T) {
+	testutil.RequirePOSIX(t)
+
+	w := newSandboxTestWorker(t, "agentfm-test:v1") // no limits configured
+	testutil.InstallFakePodman(t, "#!/bin/sh\nif [ \"$1\" = \"run\" ]; then exit 137; fi\nexit 0\n")
+
+	_, err := w.executePodman(context.Background(), "prompt", os.Stdout, os.Stderr)
+
+	if errors.Is(err, ErrSandboxOOMKilled) {
+		t.Error("an OOM kill was attributed to a memory limit that was never set")
+	}
+	if !errors.Is(err, ErrSandboxFailed) {
+		t.Fatalf("got error %v, want ErrSandboxFailed", err)
+	}
+}
+
+// The limits configured on the worker must actually reach the container. This
+// is the test that fails if the wiring from Config to SandboxSpec is dropped.
+func TestExecutePodman_AppliesConfiguredLimits(t *testing.T) {
+	testutil.RequirePOSIX(t)
+
+	w := newSandboxTestWorker(t, "agentfm-test:v1")
+	w.config.Limits = ResourceLimits{CPUs: 2, MemoryBytes: 128 << 20, PidsLimit: 512}
+
+	argsFile := filepath.Join(t.TempDir(), "args")
+	testutil.InstallFakePodman(t, "#!/bin/sh\nif [ \"$1\" = \"run\" ]; then echo \"$@\" > "+argsFile+"; fi\nexit 0\n")
+
+	if _, err := w.executePodman(context.Background(), "prompt", os.Stdout, os.Stderr); err != nil {
+		t.Fatalf("executePodman: %v", err)
+	}
+
+	raw, readErr := os.ReadFile(argsFile)
+	if readErr != nil {
+		t.Fatalf("fake podman never recorded its arguments: %v", readErr)
+	}
+	for _, want := range []string{"--cpus 2", "--memory 134217728", "--memory-swap 134217728", "--pids-limit 512"} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("configured limit missing from the container's argv: %q not in %q", want, string(raw))
+		}
 	}
 }
 

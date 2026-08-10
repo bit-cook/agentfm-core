@@ -190,7 +190,13 @@ func (w *Worker) handleTaskStream(rootCtx context.Context, s netcore.Stream) {
 		// accident — podman missing from PATH, container service stopped,
 		// disk full.
 		status = metrics.StatusError
-		if errors.Is(taskCtx.Err(), context.DeadlineExceeded) {
+		switch {
+		case errors.Is(execErr, ErrSandboxOOMKilled):
+			// Checked before the deadline test: a task killed by the memory
+			// cgroup may well also have been near its time budget, and the
+			// limit is the actionable cause.
+			status = metrics.StatusOOMKilled
+		case errors.Is(taskCtx.Err(), context.DeadlineExceeded):
 			// Distinguish "ran out of time" from "broke". This is the first
 			// worker-side emitter of StatusTimeout; until now the label was
 			// pre-warmed but only ever set by the Boss.

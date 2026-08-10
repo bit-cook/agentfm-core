@@ -74,6 +74,16 @@ func main() {
 	flag.Float64Var(&cfg.MaxCPU, "maxcpu", 80.0, "Max CPU usage percentage before rejecting tasks")
 	flag.Float64Var(&cfg.MaxGPU, "maxgpu", 80.0, "Max GPU VRAM usage percentage before rejecting tasks")
 
+	// Per-task cgroup ceilings (roadmap R1). These bound a RUNNING container,
+	// unlike -maxcpu/-maxgpu above which only decide whether to accept a task.
+	// CPU and memory default to unlimited: a ceiling that is wrong for a given
+	// agent kills legitimate work, so the operator opts in. The pid ceiling
+	// defaults on because it stops a fork bomb at a level no real agent
+	// approaches.
+	taskCPUs := flag.Float64("task-cpus", 0, "Per-task CPU ceiling in cores (e.g. 1.5). 0 = unlimited")
+	taskMemory := flag.String("task-memory", "", "Per-task memory ceiling, e.g. 512m or 2g (swap disabled at the same value). Empty = unlimited")
+	taskPids := flag.Int64("task-pids-limit", worker.DefaultPidsLimit, "Per-task process/thread ceiling. 0 = unlimited")
+
 	// Verifiable-mesh roles (v1.3). Plain workers default off; the
 	// flag is wired here so an operator can opt a worker into the
 	// witness role explicitly. The actual handler registration lives
@@ -109,7 +119,11 @@ func main() {
 	// just be noise — and would surface confusing limits in --help that
 	// don't apply to the chosen mode.
 	if *mode == "worker" || *mode == "test" {
-		validateOperatorConfig(cfg)
+		// cfg is passed by POINTER: the validator resolves -task-* into
+		// cfg.Limits, and a by-value copy would silently drop them — the
+		// worker would then run with no ceilings while its documentation
+		// promised otherwise.
+		validateOperatorConfig(&cfg, *taskCPUs, *taskMemory, *taskPids)
 	}
 
 	ctx := context.Background()
@@ -171,7 +185,10 @@ func main() {
 // Numeric ranges mirror the help table. String caps match the
 // WorkerProfile fields broadcast over GossipSub so a hostile author can
 // not balloon a radar row on every other Boss in the mesh.
-func validateOperatorConfig(cfg worker.Config) {
+// It also resolves the -task-* ceilings into cfg.Limits, which is why cfg is a
+// pointer: these are the only operator inputs the validator produces rather
+// than merely checks.
+func validateOperatorConfig(cfg *worker.Config, taskCPUs float64, taskMemory string, taskPids int64) {
 	if cfg.MaxCPU < 0 || cfg.MaxCPU > 99 {
 		pterm.Fatal.Println("❌ Invalid config: -maxcpu must be between 0 and 99")
 	}
@@ -180,6 +197,22 @@ func validateOperatorConfig(cfg worker.Config) {
 	}
 	if cfg.MaxConcurrentTasks < 1 || cfg.MaxConcurrentTasks > 1000 {
 		pterm.Fatal.Println("❌ Invalid config: -maxtasks must be between 1 and 1000")
+	}
+
+	// Resolve the per-task ceilings before anything starts: a worker with an
+	// unusable limit must refuse to boot rather than discover it on the first
+	// task, when the failure would look like a broken agent.
+	memBytes, memErr := worker.ParseSize(taskMemory)
+	if memErr != nil {
+		pterm.Fatal.Printfln("❌ Invalid config: -task-memory: %v", memErr)
+	}
+	cfg.Limits = worker.ResourceLimits{
+		CPUs:        taskCPUs,
+		MemoryBytes: memBytes,
+		PidsLimit:   taskPids,
+	}
+	if err := cfg.Limits.Validate(); err != nil {
+		pterm.Fatal.Printfln("❌ Invalid config: %v", err)
 	}
 	if len(cfg.AgentName) > 20 {
 		pterm.Fatal.Printfln("❌ Invalid config: -agent name is too long (%d/20 chars max)", len(cfg.AgentName))

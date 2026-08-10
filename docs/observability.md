@@ -15,7 +15,7 @@ Every role exposes Prometheus `/metrics` and structured `slog` logs. A single Pr
 
 | Name | Type | Labels |
 |---|---|---|
-| `agentfm_tasks_total` | Counter | `status` ∈ `{ok, error, rejected, timeout}` |
+| `agentfm_tasks_total` | Counter | `status` ∈ `{ok, error, rejected, timeout, oom_killed}` |
 | `agentfm_task_duration_seconds` | Histogram | (none) — buckets tuned for AI workloads (1s → 30 min) |
 | `agentfm_workers_online` | Gauge | (none) |
 | `agentfm_artifact_bytes_sent_total` | Counter | (none) |

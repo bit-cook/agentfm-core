@@ -75,6 +75,34 @@ Workers reject incoming task streams when any of these limits trip:
 
 Telemetry broadcasts the current values every 2s so the Boss radar shows real load. The matcher (in OpenAI-routed mode) prefers least-loaded peers within a tier.
 
+## Per-task resource ceilings
+
+The three limits above are **admission thresholds** — they decide whether to accept a task, and constrain nothing once a container is running. The flags below bound the running container itself, through its cgroup:
+
+| Flag | Default | What it bounds |
+|---|:---:|---|
+| `-task-cpus` | `0` (unlimited) | CPU time in cores, e.g. `1.5`. Maps to `--cpus`. |
+| `-task-memory` | empty (unlimited) | Resident memory, e.g. `512m`, `2g`, `1GiB`. Maps to `--memory`, and to `--memory-swap` at the same value so the container cannot swap instead of dying. |
+| `-task-pids-limit` | `1024` | Processes **and threads**. Maps to `--pids-limit`. `0` disables. |
+
+CPU and memory default to unlimited on purpose: a ceiling that is wrong for a given agent kills legitimate work, so the operator opts in after observing what their agent actually uses. The pid ceiling defaults **on** because a fork bomb is contained at a level no real agent approaches — a threaded Python or torch agent on a large host runs in the low hundreds of threads. Raise it if your agent needs more; note that threads count, not just processes.
+
+A worker with an unusable ceiling refuses to start rather than failing on its first task, where the failure would look like a broken agent.
+
+Sizes are **integers** with an optional `k`/`m`/`g` suffix (1024-based, as in podman). Fractional values such as `1.5g` are rejected rather than rounded — write `1536m`.
+
+The worker prints the ceilings it will apply at startup, so you can confirm your flags took effect.
+
+When a task is killed for exceeding its memory ceiling, the worker reports it distinctly — `agentfm_tasks_total{status="oom_killed"}` rather than `error` — so a limit set too low is distinguishable from an agent that genuinely crashes. See [Observability](observability.md).
+
+**Caveat on that attribution.** It is inferred from the container's `137` exit code, which is a strong signal but not proof. A task timeout is never mislabelled (context cancellation is distinguishable), but two other cases are counted as `oom_killed`: a kill by the *host's* OOM killer under global memory pressure, and an agent that exits `137` deliberately. Both affect the metric only, and only when a memory ceiling is configured.
+
+```bash
+# 2 cores, 4 GiB, default pid ceiling
+agentfm -mode worker -agentdir ./my-agent -image my-agent:v1 \
+  -task-cpus 2 -task-memory 4g
+```
+
 ## Related
 
 - [OpenAI-Compatible API](openai.md) — how clients dispatch tasks to your worker

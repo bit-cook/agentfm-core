@@ -3,6 +3,7 @@ package worker
 import (
 	"errors"
 	"fmt"
+	"strconv"
 )
 
 // This file isolates the container execution *policy* — the exact argv handed
@@ -111,6 +112,10 @@ type SandboxSpec struct {
 	// Network selects the container's network namespace. Required — the zero
 	// value is rejected so a caller cannot fall into a mode by omission.
 	Network NetworkMode
+
+	// Limits are the cgroup ceilings for this container (roadmap R1). Zero
+	// fields emit no flag, reproducing the historical unbounded behaviour.
+	Limits ResourceLimits
 }
 
 // BuildRunArgs renders spec into the argument vector for `podman run`.
@@ -144,6 +149,27 @@ func BuildRunArgs(spec SandboxSpec) ([]string, error) {
 		args = append(args, "--network", "host")
 	default:
 		return nil, fmt.Errorf("network mode %q: %w", spec.Network, ErrUnsupportedNetwork)
+	}
+
+	// Resource ceilings (R1). A zero field emits nothing, so an operator who
+	// configures no limit gets exactly the pre-R1 argv.
+	if err := spec.Limits.Validate(); err != nil {
+		return nil, err
+	}
+	if spec.Limits.CPUs > 0 {
+		args = append(args, "--cpus", strconv.FormatFloat(spec.Limits.CPUs, 'f', -1, 64))
+	}
+	if spec.Limits.MemoryBytes > 0 {
+		// --memory-swap is set to the SAME value as --memory, which is how
+		// podman expresses "no swap on top of the memory ceiling". Omitting it
+		// grants the container an equal amount of swap by default: the
+		// container then thrashes the host's disk instead of being killed,
+		// which is a worse failure than the one the limit exists to prevent.
+		mem := strconv.FormatInt(spec.Limits.MemoryBytes, 10)
+		args = append(args, "--memory", mem, "--memory-swap", mem)
+	}
+	if spec.Limits.PidsLimit > 0 {
+		args = append(args, "--pids-limit", strconv.FormatInt(spec.Limits.PidsLimit, 10))
 	}
 
 	if spec.GPUDevice != "" {

@@ -128,6 +128,104 @@ func TestBuildRunArgs_Golden(t *testing.T) {
 	}
 }
 
+// Resource ceilings (R1). Pinned separately from the base golden so the two
+// concerns fail independently: a broken limit must not read as a broken argv.
+func TestBuildRunArgs_GoldenWithResourceLimits(t *testing.T) {
+	got, err := BuildRunArgs(SandboxSpec{
+		ContainerName: "c",
+		Image:         "img",
+		Prompt:        "p",
+		OutputDir:     "/out",
+		ModelName:     "m",
+		Network:       NetworkHost,
+		Limits: ResourceLimits{
+			CPUs:        1.5,
+			MemoryBytes: 512 << 20,
+			PidsLimit:   1024,
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildRunArgs returned an unexpected error: %v", err)
+	}
+
+	assertArgs(t, got, []string{
+		"run", "--rm", "--name", "c",
+		"--network", "host",
+		"--cpus", "1.5",
+		"--memory", "536870912", "--memory-swap", "536870912",
+		"--pids-limit", "1024",
+		"-v", "/out:/tmp/output:z",
+		"-e", "AGENTFM_MODEL=m",
+		"img", "p",
+	})
+}
+
+// --memory without --memory-swap at the same value grants the container an
+// equal amount of swap, so it thrashes the host's disk instead of dying. The
+// pair must never drift apart.
+func TestBuildRunArgs_MemoryLimitAlsoDisablesSwap(t *testing.T) {
+	got, err := BuildRunArgs(SandboxSpec{
+		ContainerName: "c", Image: "img", OutputDir: "/out", Network: NetworkHost,
+		Limits: ResourceLimits{MemoryBytes: 256 << 20},
+	})
+	if err != nil {
+		t.Fatalf("BuildRunArgs returned an unexpected error: %v", err)
+	}
+
+	memAt := slices.Index(got, "--memory")
+	swapAt := slices.Index(got, "--memory-swap")
+	if memAt < 0 || swapAt < 0 {
+		t.Fatalf("--memory / --memory-swap missing from %q", got)
+	}
+	if got[memAt+1] != got[swapAt+1] {
+		t.Errorf("swap is not disabled: --memory=%s but --memory-swap=%s", got[memAt+1], got[swapAt+1])
+	}
+}
+
+// Zero limits must emit nothing at all, so an operator who configures no
+// ceiling gets byte-for-byte the pre-R1 argv.
+func TestBuildRunArgs_ZeroLimitsEmitNoFlags(t *testing.T) {
+	got, err := BuildRunArgs(SandboxSpec{
+		ContainerName: "c", Image: "img", OutputDir: "/out", Network: NetworkHost,
+	})
+	if err != nil {
+		t.Fatalf("BuildRunArgs returned an unexpected error: %v", err)
+	}
+	for _, flag := range []string{"--cpus", "--memory", "--memory-swap", "--pids-limit"} {
+		if slices.Contains(got, flag) {
+			t.Errorf("%s emitted although no limit is configured: %q", flag, got)
+		}
+	}
+}
+
+// An unusable limit must stop the argv from being built at all rather than
+// producing a container podman will reject or, worse, accept with a ceiling
+// that means something else.
+func TestBuildRunArgs_RejectsInvalidLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		limits ResourceLimits
+	}{
+		{"negative cpus", ResourceLimits{CPUs: -1}},
+		{"negative memory", ResourceLimits{MemoryBytes: -1}},
+		{"negative pids", ResourceLimits{PidsLimit: -1}},
+		{"unbootably small memory", ResourceLimits{MemoryBytes: 4096}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args, err := BuildRunArgs(SandboxSpec{
+				ContainerName: "c", Image: "img", OutputDir: "/out",
+				Network: NetworkHost, Limits: tc.limits,
+			})
+			if !errors.Is(err, ErrInvalidLimit) {
+				t.Fatalf("got %v, want ErrInvalidLimit", err)
+			}
+			if args != nil {
+				t.Errorf("args must be nil on error, got %q", args)
+			}
+		})
+	}
+}
+
 // Optional inputs must be omitted entirely rather than emitted empty: a bare
 // `--device` or `--env-file` with no value would shift every following
 // argument and make podman consume the next flag as its operand.
