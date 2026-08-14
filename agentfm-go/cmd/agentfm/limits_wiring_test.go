@@ -50,10 +50,10 @@ func TestValidateOperatorConfig_LimitsReachTheContainerArgv(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"--cpus":         "2",
-		"--memory":       "536870912",
-		"--memory-swap":  "536870912",
-		"--pids-limit":   "777",
+		"--cpus":        "2",
+		"--memory":      "536870912",
+		"--memory-swap": "536870912",
+		"--pids-limit":  "777",
 	}
 	for flag, value := range want {
 		var found bool
