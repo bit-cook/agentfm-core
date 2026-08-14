@@ -31,11 +31,14 @@ Thumbs.db
 *.swp
 *~
 server.py
-constants.go
 graphify-out
 superpowers
 walkthrough
 .superpowers
+
+# Task output directories. The worker anchors these on its working directory,
+# so a worker started from a clone would otherwise stage real Boss task data.
+.agentfm_temp/
 
 # Build artifacts (ship via GitHub Releases, not VCS)
 agentfm-go/dist/
@@ -45,7 +48,6 @@ agentfm-go/relay
 # Python bytecode
 __pycache__/
 *.pyc
-.github
 .mypy_cache
 .pytest_cache
 .ruff_cache

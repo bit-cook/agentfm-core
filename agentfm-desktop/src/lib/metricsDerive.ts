@@ -51,7 +51,13 @@ export function computeP95FromBuckets(buckets: HistogramBucket[]): number {
 
 export { latestValue }
 
-const TASK_STATUSES = ['ok', 'error', 'rejected', 'timeout'] as const
+// Must enumerate EVERY status the worker emits for agentfm_tasks_total: this
+// list is the denominator of the success rate, so a missing value makes those
+// tasks vanish from the chart entirely rather than counting as failures. A
+// worker whose memory ceiling kills every task would otherwise show a 100%
+// success rate — the failure becomes less visible, not more.
+// Source of truth: internal/metrics/metrics.go (Status* constants).
+const TASK_STATUSES = ['ok', 'error', 'rejected', 'timeout', 'oom_killed'] as const
 
 export function computeSuccessRateSeries(
   buffers: Map<string, RingBuffer>,

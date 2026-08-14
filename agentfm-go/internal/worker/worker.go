@@ -25,6 +25,12 @@ type Config struct {
 	MaxGPU             float64 // dynamic GPU limit
 	Author             string
 
+	// Limits are the per-task cgroup ceilings (roadmap R1). Distinct from
+	// MaxCPU / MaxGPU above, which are *admission* thresholds — "is this
+	// host too busy to accept another task" — and constrain nothing once a
+	// container is running. Limits is what actually bounds a task.
+	Limits ResourceLimits
+
 	// IsWitness reports whether this worker process should advertise
 	// the P2-2 witness role and (in P2-2) register the WitnessProtocol
 	// stream handler. Set from the --witness flag on cmd/agentfm.
@@ -89,9 +95,17 @@ func RunLocalTest(ctx context.Context, cfg Config, prompt string) error {
 	fmt.Println("--------------------------------------------------")
 
 	// Use os.Stdout for testing locally
-	outputDir := w.executePodman(ctx, prompt, os.Stdout, os.Stderr)
+	outputDir, execErr := w.executePodman(ctx, prompt, os.Stdout, os.Stderr)
 
 	fmt.Println("\n--------------------------------------------------")
+
+	// Surface the failure as a non-zero exit of `agentfm -mode test` rather
+	// than printing a success banner. An operator validating an agent image
+	// locally must not read "execution finished" when podman never ran.
+	if execErr != nil {
+		return fmt.Errorf("local sandbox run: %w", execErr)
+	}
+
 	pterm.Success.Printfln("✅ Sandbox execution finished.\n📂 Artifacts saved to: %s", outputDir)
 
 	return nil
@@ -127,6 +141,12 @@ func (w *Worker) Start(ctx context.Context) {
 	}
 
 	printHostNetworkWarning()
+
+	// Surface the ceilings that will actually be applied. Without this an
+	// operator has no way to confirm their -task-* flags took effect short of
+	// inspecting a running container's cgroup — and a limit believed to be in
+	// force but silently absent is worse than no limit at all.
+	pterm.Info.Printfln("Per-task resource ceilings: %s", w.config.Limits.Describe())
 
 	w.printMetadata()
 	w.wg.Add(1)
